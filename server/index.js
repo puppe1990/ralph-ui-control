@@ -3,13 +3,10 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execSync, spawn, spawnSync } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..');
-const DEFAULT_RALPH_SCRIPT_CODEX = path.join(WORKSPACE_ROOT, 'ralph-codex', 'ralph_loop.sh');
-const DEFAULT_RALPH_SCRIPT_GEMINI = path.join(WORKSPACE_ROOT, 'packages', 'ralph-gemini', 'bin', 'ralph-gemini-loop.sh');
 const DEFAULT_RALPH_BIN = '/Users/matheuspuppe/.local/bin/ralph';
 const QUOTA_SNAPSHOT_STALE_SECONDS = 15 * 60;
 const RUNTIME_ORPHAN_THRESHOLD_SECONDS = 45;
@@ -18,65 +15,11 @@ const UI_CACHE_FILE = path.join(__dirname, '.cache', 'project-status-cache.json'
 app.use(cors());
 app.use(express.json());
 
-function resolveProvider(value) {
-  const provider = String(value || 'gemini').toLowerCase();
-  if (provider === 'codex') return 'codex';
-  return 'gemini';
-}
-
-function getProviderConfig(providerInput) {
-  const provider = resolveProvider(providerInput);
-  if (provider === 'codex') {
-    return {
-      provider,
-      displayName: 'Codex',
-      defaultScript: DEFAULT_RALPH_SCRIPT_CODEX,
-      defaultRunArgs: '--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose',
-      defaultRecoverArgs: '--sandbox workspace-write --full-auto --auto-reset-circuit --timeout 20 --calls 30 --verbose',
-      logFileBasename: 'ralph.log',
-      stderrPrefix: 'codex_stderr_',
-      statusSnapshotFile: 'codex_status_snapshot.txt',
-      sessionFile: '.codex_session_id'
-    };
-  }
-  return {
-    provider,
-    displayName: 'Gemini',
-    defaultScript: DEFAULT_RALPH_SCRIPT_GEMINI,
-    defaultRunArgs: '--max-loops 30 --sleep 2',
-    defaultRecoverArgs: '--max-loops 30 --sleep 2',
-    logFileBasename: 'ralph-gemini.log',
-    stderrPrefix: 'gemini_stderr_',
-    statusSnapshotFile: null,
-    sessionFile: '.gemini_session_id'
-  };
-}
-
-function listProviderCapabilities() {
-  const gemini = getProviderConfig('gemini');
-  const codex = getProviderConfig('codex');
-  return {
-    defaultProvider: 'gemini',
-    providers: {
-      gemini: {
-        id: gemini.provider,
-        displayName: gemini.displayName,
-        defaultArgs: gemini.defaultRunArgs,
-        supportsDiagnosticsRefresh: false,
-        supportsQuotaSnapshot: false,
-        logFileBasename: gemini.logFileBasename
-      },
-      codex: {
-        id: codex.provider,
-        displayName: codex.displayName,
-        defaultArgs: codex.defaultRunArgs,
-        supportsDiagnosticsRefresh: true,
-        supportsQuotaSnapshot: true,
-        logFileBasename: codex.logFileBasename
-      }
-    }
-  };
-}
+const {
+  resolveProvider,
+  getProviderConfig,
+  listProviderCapabilities,
+} = require('./providers');
 
 function safeReadJson(filePath) {
   try {
@@ -281,6 +224,84 @@ function listRuntimeProcesses(providerInput = 'gemini') {
   } catch {
     return [];
   }
+}
+
+function normalizeSelectedFolderPath(rawPath) {
+  const trimmed = String(rawPath || '').trim();
+  if (!trimmed) return '';
+  const normalized = path.normalize(trimmed);
+  if (normalized.length > 1 && normalized.endsWith(path.sep)) {
+    return normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
+function selectFolderPath(platform = process.platform) {
+  let stdout = '';
+  let stderr = '';
+  let status = 0;
+
+  if (platform === 'darwin') {
+    const script = 'POSIX path of (choose folder with prompt "Select a project folder for Ralph Control UI")';
+    const result = spawnSync('osascript', ['-e', script], { encoding: 'utf8' });
+    stdout = result.stdout || '';
+    stderr = result.stderr || '';
+    status = result.status ?? 0;
+  } else if (platform === 'linux') {
+    const result = spawnSync('zenity', ['--file-selection', '--directory', '--title=Select a project folder for Ralph Control UI'], {
+      encoding: 'utf8'
+    });
+    stdout = result.stdout || '';
+    stderr = result.stderr || '';
+    status = result.status ?? 0;
+  } else if (platform === 'win32') {
+    const script = [
+      'Add-Type -AssemblyName System.Windows.Forms',
+      '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+      '$dialog.Description = "Select a project folder for Ralph Control UI"',
+      '$dialog.ShowNewFolderButton = $false',
+      '$result = $dialog.ShowDialog()',
+      'if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath }'
+    ].join('; ');
+    const result = spawnSync(
+      'powershell',
+      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { encoding: 'utf8' }
+    );
+    stdout = result.stdout || '';
+    stderr = result.stderr || '';
+    status = result.status ?? 0;
+  } else {
+    const unsupported = new Error(`Folder picker not supported on platform: ${platform}`);
+    unsupported.code = 'UNSUPPORTED';
+    throw unsupported;
+  }
+
+  if (status !== 0) {
+    const detail = `${stdout}\n${stderr}`.toLowerCase();
+    if (detail.includes('user canceled') || detail.includes('cancelled') || detail.includes('canceled')) {
+      const canceled = new Error('Folder selection canceled');
+      canceled.code = 'CANCELED';
+      throw canceled;
+    }
+    const failure = new Error((stderr || stdout || 'failed to select folder').trim());
+    failure.code = 'FAILED';
+    throw failure;
+  }
+
+  const selectedPath = normalizeSelectedFolderPath(stdout);
+  if (!selectedPath) {
+    const canceled = new Error('Folder selection canceled');
+    canceled.code = 'CANCELED';
+    throw canceled;
+  }
+  if (!fs.existsSync(selectedPath) || !fs.statSync(selectedPath).isDirectory()) {
+    const invalid = new Error('Selected path is not a valid directory');
+    invalid.code = 'INVALID_PATH';
+    throw invalid;
+  }
+
+  return selectedPath;
 }
 
 function getStatusAgeSeconds(status) {
@@ -713,6 +734,21 @@ app.get('/api/providers', (_req, res) => {
   res.json(listProviderCapabilities());
 });
 
+app.get('/api/select-folder', (_req, res) => {
+  try {
+    const projectPath = selectFolderPath();
+    return res.json({ projectPath });
+  } catch (error) {
+    if (error?.code === 'CANCELED') {
+      return res.status(409).json({ error: 'Selecao de pasta cancelada', canceled: true });
+    }
+    if (error?.code === 'UNSUPPORTED') {
+      return res.status(501).json({ error: error.message });
+    }
+    return res.status(500).json({ error: error?.message || 'Falha ao selecionar pasta' });
+  }
+});
+
 app.get('/api/processes', (req, res) => {
   const provider = resolveProvider(req.query.provider);
   res.json({ provider, processes: listRuntimeProcesses(provider) });
@@ -733,6 +769,14 @@ function launchRalph({ projectPath, args, ralphScript }) {
   child.unref();
 
   return { pid: child.pid, logFile, command };
+}
+
+function persistFixPlan(projectPath, fixPlan = '') {
+  const ralphDir = path.join(projectPath, '.ralph');
+  fs.mkdirSync(ralphDir, { recursive: true });
+  const fixPlanFile = path.join(ralphDir, 'fix_plan.md');
+  fs.writeFileSync(fixPlanFile, String(fixPlan), 'utf8');
+  return fixPlanFile;
 }
 
 function refreshRalphDiagnostics({ projectPath }) {
@@ -797,11 +841,16 @@ app.post('/api/run', (req, res) => {
   const {
     projectPath,
     args = providerConfig.defaultRunArgs,
-    ralphScript = providerConfig.defaultScript
+    ralphScript = providerConfig.defaultScript,
+    fixPlan
   } = req.body || {};
 
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
+  }
+
+  if (typeof fixPlan === 'string') {
+    persistFixPlan(projectPath, fixPlan);
   }
 
   const launched = launchRalph({ projectPath, args, ralphScript });
@@ -814,17 +863,35 @@ app.post('/api/recover', (req, res) => {
   const {
     projectPath,
     args = providerConfig.defaultRecoverArgs,
-    ralphScript = providerConfig.defaultScript
+    ralphScript = providerConfig.defaultScript,
+    fixPlan
   } = req.body || {};
 
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
   }
 
+  if (typeof fixPlan === 'string') {
+    persistFixPlan(projectPath, fixPlan);
+  }
+
   resetCircuitState({ projectPath, providerInput: provider });
 
   const launched = launchRalph({ projectPath, args, ralphScript });
   return res.json({ recovered: true, provider, ...launched });
+});
+
+app.post('/api/fix-plan', (req, res) => {
+  const projectPath = req.body?.projectPath;
+  const fixPlan = req.body?.fixPlan;
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
+  if (typeof fixPlan !== 'string') {
+    return res.status(400).json({ error: 'fixPlan invalido' });
+  }
+  const file = persistFixPlan(projectPath, fixPlan);
+  return res.json({ saved: true, file });
 });
 
 app.post('/api/refresh-diagnostics', (req, res) => {
@@ -1035,5 +1102,7 @@ module.exports = {
   formatResetLabelFromEpoch,
   deriveDiagnosticRootCause,
   deriveDiagnosticRecommendation,
-  listProviderCapabilities
+  listProviderCapabilities,
+  normalizeSelectedFolderPath,
+  persistFixPlan
 };

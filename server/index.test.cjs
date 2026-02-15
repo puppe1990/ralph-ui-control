@@ -1,5 +1,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   parseLimitLine,
@@ -8,7 +11,9 @@ const {
   formatResetLabelFromEpoch,
   deriveDiagnosticRootCause,
   deriveDiagnosticRecommendation,
-  listProviderCapabilities
+  listProviderCapabilities,
+  normalizeSelectedFolderPath,
+  persistFixPlan
 } = require('./index.js');
 
 test('parseLimitLine converts epoch reset labels to human-readable local label', () => {
@@ -108,4 +113,18 @@ test('listProviderCapabilities returns gemini as default provider', () => {
   assert.equal(capabilities.defaultProvider, 'gemini');
   assert.equal(capabilities.providers.gemini.supportsDiagnosticsRefresh, false);
   assert.equal(capabilities.providers.codex.supportsDiagnosticsRefresh, true);
+});
+
+test('normalizeSelectedFolderPath trims and removes trailing slash', () => {
+  assert.equal(normalizeSelectedFolderPath('  /tmp/my-project/  '), '/tmp/my-project');
+  assert.equal(normalizeSelectedFolderPath(''), '');
+});
+
+test('persistFixPlan writes .ralph/fix_plan.md', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ralph-ui-'));
+  const content = '# Fix plan\n\n1. Update architecture';
+  const file = persistFixPlan(tmpDir, content);
+  assert.equal(path.basename(file), 'fix_plan.md');
+  assert.equal(fs.readFileSync(file, 'utf8'), content);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });

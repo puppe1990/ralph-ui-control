@@ -225,7 +225,10 @@ export function App() {
   const [runtime, setRuntime] = useState(null);
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
+  const [fixPlanDraft, setFixPlanDraft] = useState('');
   const [message, setMessage] = useState('');
+  const [selectingFolder, setSelectingFolder] = useState(false);
+  const [savingFixPlan, setSavingFixPlan] = useState(false);
   const [nowEpoch, setNowEpoch] = useState(() => Math.floor(Date.now() / 1000));
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
   const [logsFullscreen, setLogsFullscreen] = useState(false);
@@ -292,9 +295,36 @@ export function App() {
         setProcesses(data.processes);
       }
       setLogs(data.logs || '');
-      setFixPlan(data.fixPlan || '');
+      const loadedFixPlan = data.fixPlan || '';
+      setFixPlan(loadedFixPlan);
+      setFixPlanDraft(loadedFixPlan);
     } catch {
       setMessage('Erro de rede ao consultar status do projeto');
+    }
+  }
+
+  async function saveFixPlan() {
+    if (savingFixPlan) return false;
+    setSavingFixPlan(true);
+    try {
+      const res = await fetch('/api/fix-plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath, fixPlan: fixPlanDraft })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMessage(`Erro ao salvar fix plan: ${data?.error || 'falha inesperada'}`);
+        return false;
+      }
+      setFixPlan(fixPlanDraft);
+      setMessage('Fix plan salvo com sucesso');
+      return true;
+    } catch {
+      setMessage('Erro ao salvar fix plan');
+      return false;
+    } finally {
+      setSavingFixPlan(false);
     }
   }
 
@@ -304,18 +334,47 @@ export function App() {
       const res = await fetch('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, args, provider })
+        body: JSON.stringify({ projectPath, args, provider, fixPlan: fixPlanDraft })
       });
       const data = await res.json();
       if (!res.ok) {
         setMessage(`Erro: ${data.error}`);
         return;
       }
+      setFixPlan(fixPlanDraft);
       setMessage(`Ralph iniciado (PID ${data.pid})`);
       await refreshProcesses();
       await refreshProject();
     } catch {
       setMessage('Erro ao iniciar Ralph');
+    }
+  }
+
+  async function selectProjectFolder() {
+    if (selectingFolder) return;
+    setSelectingFolder(true);
+    setMessage('Abrindo seletor de pasta...');
+    try {
+      const res = await fetch('/api/select-folder');
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (data?.canceled) {
+          setMessage('Selecao de pasta cancelada');
+        } else {
+          setMessage(`Erro ao selecionar pasta: ${data?.error || 'falha inesperada'}`);
+        }
+        return;
+      }
+      if (data?.projectPath) {
+        setProjectPath(data.projectPath);
+        setMessage(`Projeto selecionado: ${data.projectPath}`);
+      } else {
+        setMessage('Nenhuma pasta selecionada');
+      }
+    } catch {
+      setMessage('Erro ao abrir seletor de pasta');
+    } finally {
+      setSelectingFolder(false);
     }
   }
 
@@ -325,13 +384,14 @@ export function App() {
       const res = await fetch('/api/recover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, args, provider })
+        body: JSON.stringify({ projectPath, args, provider, fixPlan: fixPlanDraft })
       });
       const data = await res.json();
       if (!res.ok) {
         setMessage(`Erro ao recuperar: ${data.error || 'falha inesperada'}`);
         return;
       }
+      setFixPlan(fixPlanDraft);
       setMessage(`Loop recuperado (PID ${data.pid})`);
       await refreshProcesses();
       await refreshProject();
@@ -590,13 +650,9 @@ export function App() {
     }
     return status?.loop_elapsed_hms ?? '00:00:00';
   }, [status, nowEpoch, isRateLimited, isRuntimeActive]);
-  const diagnosticsAgeLabel = diagnostics?.generatedAgeSeconds != null ? formatAge(diagnostics.generatedAgeSeconds) : '--';
-  const diagnosticsBadgeVariant = diagnostics?.isStale ? 'warning' : 'outline';
-  const diagnosticsRootCause = diagnostics?.rootCause || 'Sem diagnostico consolidado';
-  const diagnosticsRecommendation = diagnostics?.recommendation || 'Atualize o diagnostico para obter recomendacoes.';
-  const diagnosticsSource = diagnostics?.source || 'derived';
   const supportsDiagnosticsRefresh = providerCapabilities?.providers?.[provider]?.supportsDiagnosticsRefresh !== false;
   const logLines = useMemo(() => String(logs || '').split('\n'), [logs]);
+  const fixPlanDirty = fixPlanDraft !== fixPlan;
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -720,7 +776,13 @@ export function App() {
           <CardContent className="space-y-4">
             <div className="space-y-2">
               <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Projeto</label>
-              <Input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} />
+              <div className="flex gap-2">
+                <Input value={projectPath} onChange={(e) => setProjectPath(e.target.value)} />
+                <Button type="button" variant="outline" onClick={selectProjectFolder} disabled={selectingFolder}>
+                  <FolderSearch className="h-4 w-4" />
+                  {selectingFolder ? 'Selecionando...' : 'Selecionar pasta'}
+                </Button>
+              </div>
             </div>
 
             <div className="space-y-2">
@@ -787,28 +849,23 @@ export function App() {
         <Card className="lg:col-span-2">
           <CardHeader>
             <div className="flex items-center justify-between gap-2">
-              <div>
-                <CardTitle className="text-lg">Diagnostico Consolidado</CardTitle>
-                <CardDescription>Causa raiz e proxima acao recomendada.</CardDescription>
-              </div>
-              <Badge variant={diagnosticsBadgeVariant} className="px-3 py-1 text-xs">
-                {diagnostics?.isStale ? 'STALE' : 'FRESH'} ({diagnosticsAgeLabel})
-              </Badge>
+              <CardTitle className="text-lg">Fix Plan</CardTitle>
+              <Button variant="outline" size="sm" onClick={saveFixPlan} disabled={savingFixPlan || !fixPlanDirty}>
+                {savingFixPlan ? 'Salvando...' : 'Salvar'}
+              </Button>
             </div>
           </CardHeader>
-          <CardContent className="space-y-3">
-            <div className="rounded-md border border-border/70 bg-card/60 p-3">
-              <div className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Root cause</div>
-              <div className="text-sm">{diagnosticsRootCause}</div>
-            </div>
-            <div className="rounded-md border border-border/70 bg-card/60 p-3">
-              <div className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Next action</div>
-              <div className="text-sm">{diagnosticsRecommendation}</div>
-            </div>
-            <div className="grid gap-1 text-xs text-muted-foreground">
-              <div>Source: {diagnosticsSource}</div>
-              <div>Generated: {diagnostics?.generatedAt || '--'}</div>
-              <div>File: {diagnostics?.files?.json || '--'}</div>
+          <CardContent>
+            <div className="space-y-2">
+              <Textarea
+                className="min-h-[330px] font-mono text-xs"
+                value={fixPlanDraft}
+                onChange={(e) => setFixPlanDraft(e.target.value)}
+                placeholder="Escreva aqui o fix plan que o script deve seguir..."
+              />
+              <div className="text-xs text-muted-foreground">
+                {fixPlanDirty ? 'Alterações pendentes. Salve ou clique em Rodar/Recover para aplicar automaticamente.' : 'Fix plan sincronizado com o projeto.'}
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -873,7 +930,7 @@ export function App() {
         </Card>
       </section>
 
-      <section className="grid gap-4 xl:grid-cols-2">
+      <section className="grid gap-4">
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
@@ -921,16 +978,6 @@ export function App() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Fix Plan</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <pre className="log-surface max-h-[420px] overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200">
-              {fixPlan || 'Sem fix plan disponível.'}
-            </pre>
-          </CardContent>
-        </Card>
       </section>
 
       {logsFullscreen && (
