@@ -8,6 +8,7 @@ const { execSync, spawn } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_RALPH_SCRIPT = '/Users/matheuspuppe/Desktop/Projetos/github/ralph-codex/ralph_loop.sh';
+const QUOTA_SNAPSHOT_STALE_SECONDS = 15 * 60;
 
 app.use(cors());
 app.use(express.json());
@@ -258,6 +259,13 @@ function buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits,
       },
       updatedAt: new Date().toISOString(),
       source: 'codex_sessions'
+    };
+  }
+
+  if (snapshotHasNumbers) {
+    return {
+      ...codexStatusSnapshot,
+      source: codexStatusSnapshot?.source || 'snapshot_stale'
     };
   }
 
@@ -580,7 +588,7 @@ app.get('/api/project-status', (req, res) => {
     const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(snapshotCapturedAt)) / 1000));
     codexStatusSnapshot.capturedAt = snapshotCapturedAt;
     codexStatusSnapshot.ageSeconds = ageSeconds;
-    codexStatusSnapshot.isStale = ageSeconds > 300;
+    codexStatusSnapshot.isStale = ageSeconds > QUOTA_SNAPSHOT_STALE_SECONDS;
   }
 
   const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, status?.codex_quota_effective);

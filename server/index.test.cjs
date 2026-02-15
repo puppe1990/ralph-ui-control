@@ -62,6 +62,20 @@ test('buildEffectiveQuota prioritizes canonical status.json effective quota payl
   assert.equal(result.weekly.remainingPercent, 70);
 });
 
+test('buildEffectiveQuota uses stale snapshot as fallback when no better source exists', () => {
+  const staleSnapshot = {
+    isStale: true,
+    source: 'snapshot_file',
+    fiveHour: { status: 'ok', remainingPercent: 22, usagePercent: 78, resetLabel: 'soon' },
+    weekly: { status: 'ok', remainingPercent: 76, usagePercent: 24, resetLabel: 'later' }
+  };
+
+  const result = buildEffectiveQuota(staleSnapshot, null, null, null);
+  assert.equal(result.source, 'snapshot_file');
+  assert.equal(result.fiveHour.remainingPercent, 22);
+  assert.equal(result.weekly.remainingPercent, 76);
+});
+
 test('formatResetLabelFromEpoch returns null for invalid values', () => {
   assert.equal(formatResetLabelFromEpoch(null), null);
   assert.equal(formatResetLabelFromEpoch('bad'), null);
