@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Download,
@@ -93,6 +93,8 @@ export function App() {
   const [fixPlan, setFixPlan] = useState('');
   const [message, setMessage] = useState('');
   const [nowEpoch, setNowEpoch] = useState(() => Math.floor(Date.now() / 1000));
+  const [logsAutoScroll, setLogsAutoScroll] = useState(true);
+  const logsRef = useRef(null);
 
   async function refreshProcesses() {
     try {
@@ -262,6 +264,11 @@ export function App() {
     return () => clearInterval(tickId);
   }, []);
 
+  useEffect(() => {
+    if (!logsAutoScroll || !logsRef.current) return;
+    logsRef.current.scrollTop = logsRef.current.scrollHeight;
+  }, [logs, logsAutoScroll]);
+
   const processCount = processes.length;
   const callsSummary = status
     ? `${status.calls_made_this_hour ?? 0}/${status.max_calls_per_hour ?? 100}`
@@ -278,13 +285,20 @@ export function App() {
   const weeklyRemaining = getRemainingPercent(weeklyQuota);
   const fiveHourStatus = getQuotaStatus(fiveHourQuota);
   const weeklyStatus = getQuotaStatus(weeklyQuota);
+  const isRateLimited =
+    status?.status === 'paused' ||
+    status?.last_action === 'api_limit' ||
+    fiveHourStatus === 'limited';
   const snapshotAgeLabel = hasSnapshot ? formatAge(codexStatusSnapshot?.ageSeconds) : null;
   const liveSessionElapsed = useMemo(() => {
+    if (isRateLimited) {
+      return status?.session_elapsed_hms ?? '00:00:00';
+    }
     if (status?.session_started_epoch && Number(status.session_started_epoch) > 0) {
       return formatSecondsToHms(nowEpoch - Number(status.session_started_epoch));
     }
     return status?.session_elapsed_hms ?? '00:00:00';
-  }, [status, nowEpoch]);
+  }, [status, nowEpoch, isRateLimited]);
   const liveLoopElapsed = useMemo(() => {
     if (
       status?.loop_started_epoch &&
@@ -328,8 +342,9 @@ export function App() {
                   Snapshot /status: {codexStatusSnapshot?.isStale ? 'STALE' : 'FRESH'} ({snapshotAgeLabel} ago)
                 </Badge>
               )}
-              <Badge variant="outline" className="px-3 py-1 text-xs">
+              <Badge variant={isRateLimited ? 'warning' : 'outline'} className="px-3 py-1 text-xs">
                 <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {liveSessionElapsed}
+                {isRateLimited ? ' (paused)' : ''}
               </Badge>
             </div>
           </div>
@@ -526,10 +541,22 @@ export function App() {
       <section className="grid gap-4 xl:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">Logs (`ralph.log`)</CardTitle>
+            <div className="flex items-center justify-between gap-3">
+              <CardTitle className="text-lg">Logs (`ralph.log`)</CardTitle>
+              <Button
+                variant={logsAutoScroll ? 'secondary' : 'outline'}
+                size="sm"
+                onClick={() => setLogsAutoScroll((prev) => !prev)}
+              >
+                {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
+              </Button>
+            </div>
           </CardHeader>
           <CardContent>
-            <pre className="log-surface max-h-[420px] overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200">
+            <pre
+              ref={logsRef}
+              className="log-surface max-h-[420px] overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200"
+            >
               {logs || 'Sem logs disponíveis.'}
             </pre>
           </CardContent>
