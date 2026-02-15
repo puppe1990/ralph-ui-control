@@ -584,15 +584,18 @@ app.get('/api/project-status', (req, res) => {
   }
 
   const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, status?.codex_quota_effective);
+  const statusName = String(status?.status || '').toLowerCase();
+  const isTerminalStatus = ['error', 'failed', 'halted', 'stopped', 'completed'].includes(statusName);
+  const isFresh = typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false;
   const runtime = {
     processesCount: processes.length,
     statusAgeSeconds,
-    statusFresh: typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false,
+    statusFresh: isFresh,
     runtimeHealthy:
       processes.length > 0 &&
       status != null &&
-      ['running', 'paused', 'retrying'].includes(String(status.status || '').toLowerCase()) &&
-      (typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false)
+      isFresh &&
+      !isTerminalStatus
   };
 
   res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot, codexQuotaEffective, runtime, processes });
