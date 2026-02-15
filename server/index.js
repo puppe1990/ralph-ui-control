@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { execSync, spawn } = require('child_process');
 
 const app = express();
@@ -129,6 +130,118 @@ function getFileMtimeIso(filePath) {
   }
 }
 
+function formatResetLabelFromEpoch(resetEpochSeconds) {
+  const epoch = Number(resetEpochSeconds);
+  if (!Number.isFinite(epoch) || epoch <= 0) return null;
+  const resetDate = new Date(epoch * 1000);
+  const now = new Date();
+  const sameDay = resetDate.toDateString() === now.toDateString();
+  if (sameDay) {
+    return resetDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  }
+  return resetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function getQuotaStatusFromRemaining(remainingPercent) {
+  if (typeof remainingPercent !== 'number' || Number.isNaN(remainingPercent)) return 'unknown';
+  if (remainingPercent <= 0) return 'limited';
+  if (remainingPercent <= 10) return 'warning';
+  return 'ok';
+}
+
+function listRecentCodexSessionFiles(limit = 30) {
+  const codexRoot = path.join(os.homedir(), '.codex');
+  const sessionRoots = [path.join(codexRoot, 'sessions'), path.join(codexRoot, 'archived_sessions')];
+  const files = [];
+
+  const walk = (dirPath, depth = 0) => {
+    if (!dirPath || !fs.existsSync(dirPath) || depth > 5) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath, depth + 1);
+      } else if (entry.isFile() && /^rollout-.*\.jsonl$/i.test(entry.name)) {
+        try {
+          const mtimeMs = fs.statSync(fullPath).mtimeMs;
+          files.push({ fullPath, mtimeMs });
+        } catch {
+          // Ignore unreadable files
+        }
+      }
+    }
+  };
+
+  sessionRoots.forEach((rootPath) => walk(rootPath));
+  return files
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, limit)
+    .map((f) => f.fullPath);
+}
+
+function readLatestRateLimitsFromCodexSessions() {
+  const candidates = listRecentCodexSessionFiles(30);
+  for (const filePath of candidates) {
+    const tail = tailFile(filePath, 600);
+    const lines = tail.split('\n').filter(Boolean).reverse();
+    for (const line of lines) {
+      let json = null;
+      try {
+        json = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (json?.type !== 'event_msg' || json?.payload?.type !== 'token_count' || !json?.payload?.rate_limits) {
+        continue;
+      }
+      const primary = json.payload.rate_limits.primary;
+      const secondary = json.payload.rate_limits.secondary;
+      if (!primary && !secondary) continue;
+
+      const primaryUsed = Number(primary?.used_percent);
+      const secondaryUsed = Number(secondary?.used_percent);
+      const primaryRemaining = Number.isFinite(primaryUsed) ? Math.max(0, Math.min(100, Math.round(100 - primaryUsed))) : null;
+      const secondaryRemaining = Number.isFinite(secondaryUsed) ? Math.max(0, Math.min(100, Math.round(100 - secondaryUsed))) : null;
+
+      return {
+        sourceFile: filePath,
+        eventTimestamp: json.timestamp || null,
+        fiveHour: {
+          remainingPercent: primaryRemaining,
+          usagePercent: Number.isFinite(primaryUsed) ? Math.round(primaryUsed) : null,
+          resetLabel: formatResetLabelFromEpoch(primary?.resets_at)
+        },
+        weekly: {
+          remainingPercent: secondaryRemaining,
+          usagePercent: Number.isFinite(secondaryUsed) ? Math.round(secondaryUsed) : null,
+          resetLabel: formatResetLabelFromEpoch(secondary?.resets_at)
+        }
+      };
+    }
+  }
+  return null;
+}
+
+function buildSnapshotTextFromRateLimits(rateLimits) {
+  if (!rateLimits) return '';
+  const five = rateLimits.fiveHour || {};
+  const week = rateLimits.weekly || {};
+  const fivePart =
+    five.remainingPercent != null
+      ? `5h ${five.remainingPercent}%${five.resetLabel ? ` ${five.resetLabel}` : ''}`
+      : '5h --';
+  const weekPart =
+    week.remainingPercent != null
+      ? `Weekly ${week.remainingPercent}%${week.resetLabel ? ` ${week.resetLabel}` : ''}`
+      : 'Weekly --';
+  return `Rate limits remaining\n${fivePart}\n${weekPart}`;
+}
+
 function parseCodexQuota(projectPath) {
   const logDir = path.join(projectPath, '.ralph', 'logs');
   const ralphLog = tailFile(path.join(logDir, 'ralph.log'), 2000);
@@ -186,6 +299,57 @@ function parseCodexStatusSnapshotText(rawText) {
   const text = String(rawText || '').trim();
   if (!text) {
     return null;
+  }
+
+  const kvMatches = {};
+  text
+    .split('\n')
+    .map((line) => normalizeStatusLine(line))
+    .forEach((line) => {
+      const kv = line.match(/^([a-zA-Z0-9_]+)=(.*)$/);
+      if (!kv) return;
+      kvMatches[kv[1]] = String(kv[2] || '').trim();
+    });
+
+  if (Object.keys(kvMatches).length > 0) {
+    const parseNum = (value) => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const normalizeStatus = (remaining) => {
+      if (remaining == null) return 'unknown';
+      if (remaining <= 0) return 'limited';
+      if (remaining <= 10) return 'warning';
+      return 'ok';
+    };
+
+    const fiveRemaining = parseNum(kvMatches['5h_remaining_percent']);
+    const fiveUsed = parseNum(kvMatches['5h_used_percent']);
+    const weeklyRemaining = parseNum(kvMatches['weekly_remaining_percent']);
+    const weeklyUsed = parseNum(kvMatches['weekly_used_percent']);
+
+    const fiveReset = kvMatches['5h_resets_at'] || null;
+    const weeklyReset = kvMatches['weekly_resets_at'] || null;
+
+    return {
+      fiveHour: {
+        status: normalizeStatus(fiveRemaining),
+        usagePercent: fiveUsed,
+        remainingPercent: fiveRemaining,
+        resetLabel: fiveReset,
+        line: kvMatches['5h_human'] || ''
+      },
+      weekly: {
+        status: normalizeStatus(weeklyRemaining),
+        usagePercent: weeklyUsed,
+        remainingPercent: weeklyRemaining,
+        resetLabel: weeklyReset,
+        line: kvMatches['weekly_human'] || ''
+      },
+      updatedAt: new Date().toISOString(),
+      source: kvMatches.source || 'snapshot_kv',
+      raw: stripAnsi(text)
+    };
   }
 
   const lines = text
@@ -297,8 +461,37 @@ app.get('/api/project-status', (req, res) => {
   const logs = tailFile(logFile, 100);
   const codexQuota = parseCodexQuota(projectPath);
   const codexStatusSnapshotRaw = safeReadText(codexStatusSnapshotFile);
-  const codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
+  let codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
   const snapshotCapturedAt = getFileMtimeIso(codexStatusSnapshotFile);
+  const sessionRateLimits = readLatestRateLimitsFromCodexSessions();
+
+  const snapshotHasNumbers =
+    codexStatusSnapshot &&
+    (typeof codexStatusSnapshot?.fiveHour?.remainingPercent === 'number' ||
+      typeof codexStatusSnapshot?.weekly?.remainingPercent === 'number');
+
+  if (!snapshotHasNumbers && sessionRateLimits) {
+    codexStatusSnapshot = {
+      fiveHour: {
+        status: getQuotaStatusFromRemaining(sessionRateLimits.fiveHour?.remainingPercent),
+        remainingPercent: sessionRateLimits.fiveHour?.remainingPercent ?? null,
+        usagePercent: sessionRateLimits.fiveHour?.usagePercent ?? null,
+        resetLabel: sessionRateLimits.fiveHour?.resetLabel ?? null,
+        line: ''
+      },
+      weekly: {
+        status: getQuotaStatusFromRemaining(sessionRateLimits.weekly?.remainingPercent),
+        remainingPercent: sessionRateLimits.weekly?.remainingPercent ?? null,
+        usagePercent: sessionRateLimits.weekly?.usagePercent ?? null,
+        resetLabel: sessionRateLimits.weekly?.resetLabel ?? null,
+        line: ''
+      },
+      updatedAt: new Date().toISOString(),
+      source: 'codex_sessions_fallback',
+      raw: codexStatusSnapshotRaw || ''
+    };
+  }
+
   if (codexStatusSnapshot && snapshotCapturedAt) {
     const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(snapshotCapturedAt)) / 1000));
     codexStatusSnapshot.capturedAt = snapshotCapturedAt;
@@ -318,9 +511,21 @@ app.post('/api/codex-status-snapshot', (req, res) => {
 
   const ralphDir = path.join(projectPath, '.ralph');
   fs.mkdirSync(ralphDir, { recursive: true });
+  const normalizedInput = String(snapshotText || '').trim();
+  let snapshotToSave = normalizedInput;
+
+  if (!normalizedInput || /^\/status\s*$/i.test(normalizedInput)) {
+    const latest = readLatestRateLimitsFromCodexSessions();
+    if (latest) {
+      snapshotToSave = buildSnapshotTextFromRateLimits(latest);
+    } else if (!normalizedInput) {
+      return res.status(400).json({ error: 'cole a saida do /status ou rode novamente quando houver snapshot local' });
+    }
+  }
+
   const snapshotFile = path.join(ralphDir, 'codex_status_snapshot.txt');
-  fs.writeFileSync(snapshotFile, String(snapshotText), 'utf8');
-  const parsed = parseCodexStatusSnapshotText(snapshotText);
+  fs.writeFileSync(snapshotFile, String(snapshotToSave), 'utf8');
+  const parsed = parseCodexStatusSnapshotText(snapshotToSave);
   const capturedAt = getFileMtimeIso(snapshotFile);
   if (parsed && capturedAt) {
     parsed.capturedAt = capturedAt;
