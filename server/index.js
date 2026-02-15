@@ -598,60 +598,6 @@ app.get('/api/project-status', (req, res) => {
   res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot, codexQuotaEffective, runtime, processes });
 });
 
-app.post('/api/codex-status-snapshot', (req, res) => {
-  const projectPath = req.body?.projectPath;
-  const snapshotText = req.body?.snapshotText || '';
-  if (!projectPath || !fs.existsSync(projectPath)) {
-    return res.status(400).json({ error: 'projectPath invalido' });
-  }
-
-  const ralphDir = path.join(projectPath, '.ralph');
-  fs.mkdirSync(ralphDir, { recursive: true });
-  const normalizedInput = String(snapshotText || '').trim();
-  let snapshotToSave = normalizedInput;
-
-  if (!normalizedInput || /^\/status\s*$/i.test(normalizedInput)) {
-    const latest = readLatestRateLimitsFromCodexSessions();
-    if (latest) {
-      snapshotToSave = buildSnapshotTextFromRateLimits(latest);
-    } else if (!normalizedInput) {
-      return res.status(400).json({ error: 'cole a saida do /status ou rode novamente quando houver snapshot local' });
-    }
-  }
-
-  const snapshotFile = path.join(ralphDir, 'codex_status_snapshot.txt');
-  fs.writeFileSync(snapshotFile, String(snapshotToSave), 'utf8');
-  const parsed = parseCodexStatusSnapshotText(snapshotToSave);
-  const capturedAt = getFileMtimeIso(snapshotFile);
-  if (parsed && capturedAt) {
-    parsed.capturedAt = capturedAt;
-    parsed.ageSeconds = 0;
-    parsed.isStale = false;
-  }
-
-  return res.json({
-    saved: true,
-    file: snapshotFile,
-    parsed
-  });
-});
-
-app.post('/api/codex-status-snapshot/clear', (req, res) => {
-  const projectPath = req.body?.projectPath;
-  if (!projectPath || !fs.existsSync(projectPath)) {
-    return res.status(400).json({ error: 'projectPath invalido' });
-  }
-  const snapshotFile = path.join(projectPath, '.ralph', 'codex_status_snapshot.txt');
-  try {
-    if (fs.existsSync(snapshotFile)) {
-      fs.unlinkSync(snapshotFile);
-    }
-    return res.json({ cleared: true, file: snapshotFile });
-  } catch (error) {
-    return res.status(500).json({ error: error.message || 'falha ao limpar snapshot' });
-  }
-});
-
 app.get('/api/export-diagnostics', (req, res) => {
   const projectPath = req.query.projectPath;
   if (!projectPath || !fs.existsSync(projectPath)) {

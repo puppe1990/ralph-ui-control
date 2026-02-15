@@ -102,7 +102,6 @@ export function App() {
   const [codexStatusSnapshot, setCodexStatusSnapshot] = useState(null);
   const [codexQuotaEffective, setCodexQuotaEffective] = useState(null);
   const [runtime, setRuntime] = useState(null);
-  const [codexStatusInput, setCodexStatusInput] = useState('');
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
   const [message, setMessage] = useState('');
@@ -219,44 +218,6 @@ export function App() {
       setMessage(`Diagnostico exportado: ${fileName}`);
     } catch {
       setMessage('Erro ao exportar diagnostico');
-    }
-  }
-
-  async function saveCodexStatusSnapshot() {
-    try {
-      const res = await fetch('/api/codex-status-snapshot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, snapshotText: codexStatusInput })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setMessage(`Erro ao salvar /status: ${data.error || 'falha inesperada'}`);
-        return;
-      }
-      setMessage('Snapshot do /status salvo com sucesso');
-      await refreshProject();
-    } catch {
-      setMessage('Erro ao salvar snapshot do /status');
-    }
-  }
-
-  async function clearCodexStatusSnapshot() {
-    try {
-      const res = await fetch('/api/codex-status-snapshot/clear', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setMessage(`Erro ao limpar snapshot: ${data.error || 'falha inesperada'}`);
-        return;
-      }
-      setMessage('Snapshot do /status removido');
-      await refreshProject();
-    } catch {
-      setMessage('Erro ao limpar snapshot');
     }
   }
 
@@ -471,30 +432,12 @@ export function App() {
               />
             </div>
 
-            <div className="space-y-2">
-              <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                Snapshot do `/status` (Codex CLI)
-              </label>
-              <Textarea
-                className="min-h-[90px] font-mono text-xs"
-                placeholder="Cole aqui a saida do /status do Codex CLI para extrair cota 5h e semanal..."
-                value={codexStatusInput}
-                onChange={(e) => setCodexStatusInput(e.target.value)}
-              />
-            </div>
-
             <div className="flex flex-wrap gap-2">
               <Button onClick={startRalph}>
                 <PlayCircle className="h-4 w-4" /> Rodar Ralph
               </Button>
-              <Button variant="secondary" onClick={saveCodexStatusSnapshot}>
-                <Terminal className="h-4 w-4" /> Salvar `/status`
-              </Button>
               <Button variant="secondary" onClick={refreshCodexQuota}>
                 <RefreshCcw className="h-4 w-4" /> Atualizar Cota
-              </Button>
-              <Button variant="outline" onClick={clearCodexStatusSnapshot}>
-                <Square className="h-4 w-4" /> Limpar snapshot `/status`
               </Button>
               <Button variant="outline" onClick={exportDiagnostics}>
                 <Download className="h-4 w-4" /> Exportar Diagnostico
