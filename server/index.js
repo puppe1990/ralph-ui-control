@@ -8,7 +8,10 @@ const { execSync, spawn } = require('child_process');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_RALPH_SCRIPT = '/Users/matheuspuppe/Desktop/Projetos/github/ralph-codex/ralph_loop.sh';
+const DEFAULT_RALPH_BIN = '/Users/matheuspuppe/.local/bin/ralph';
 const QUOTA_SNAPSHOT_STALE_SECONDS = 15 * 60;
+const RUNTIME_ORPHAN_THRESHOLD_SECONDS = 45;
+const UI_CACHE_FILE = path.join(__dirname, '.cache', 'project-status-cache.json');
 
 app.use(cors());
 app.use(express.json());
@@ -18,6 +21,30 @@ function safeReadJson(filePath) {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch {
     return null;
+  }
+}
+
+function readUiCache() {
+  return safeReadJson(UI_CACHE_FILE) || {};
+}
+
+function getUiCacheRecord(projectPath) {
+  const cache = readUiCache();
+  return cache[String(projectPath)] || null;
+}
+
+function saveUiCacheRecord(projectPath, payload) {
+  try {
+    const cacheDir = path.dirname(UI_CACHE_FILE);
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const cache = readUiCache();
+    cache[String(projectPath)] = {
+      updatedAt: new Date().toISOString(),
+      payload
+    };
+    fs.writeFileSync(UI_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+  } catch {
+    // best effort cache
   }
 }
 
@@ -191,6 +218,99 @@ function getStatusAgeSeconds(status) {
   const parsed = Date.parse(ts);
   if (Number.isNaN(parsed)) return null;
   return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+}
+
+function deriveDiagnosticRootCause(status, runtime, codexQuotaEffective) {
+  const statusName = String(status?.status || '').toLowerCase();
+  const lastAction = String(status?.last_action || '').toLowerCase();
+  const exitReason = String(status?.exit_reason || '').toLowerCase();
+  const fiveHourRemaining = codexQuotaEffective?.fiveHour?.remainingPercent;
+
+  if (exitReason === 'permission_denied') return 'Permission denied by Codex sandbox/approval policy';
+  if (exitReason === 'execution_timeout' || lastAction === 'timeout') return 'Codex execution timeout';
+  if (exitReason === 'api_5hour_limit' || lastAction === 'api_limit' || fiveHourRemaining === 0) return 'Codex 5-hour rate limit reached';
+  if (exitReason === 'process_missing' || statusName === 'stopped_unexpected') return 'Ralph process ended unexpectedly (orphan runtime state)';
+  if (runtime?.runtimeHealthy === false) return 'Runtime stale/offline with no active healthy process';
+  if (statusName === 'error' || statusName === 'failed') return 'Loop execution failure reported by Ralph';
+  if (statusName === 'paused') return 'Loop paused by limiter or manual stop';
+  if (statusName === 'running' || statusName === 'executing') return 'Loop active and processing';
+  return 'Unknown state (insufficient diagnostics context)';
+}
+
+function deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective) {
+  const statusName = String(status?.status || '').toLowerCase();
+  const lastAction = String(status?.last_action || '').toLowerCase();
+  const exitReason = String(status?.exit_reason || '').toLowerCase();
+  const fiveHourRemaining = codexQuotaEffective?.fiveHour?.remainingPercent;
+
+  if (exitReason === 'permission_denied') {
+    return "Review Codex approval/sandbox settings, then run 'ralph --reset-session' and restart.";
+  }
+  if (exitReason === 'execution_timeout' || lastAction === 'timeout') {
+    return 'Increase timeout and/or split the task into smaller steps.';
+  }
+  if (exitReason === 'api_5hour_limit' || lastAction === 'api_limit' || fiveHourRemaining === 0) {
+    return 'Keep auto-wait enabled and retry after quota reset.';
+  }
+  if (exitReason === 'process_missing' || statusName === 'stopped_unexpected' || runtime?.runtimeHealthy === false) {
+    return "Use 'Recover Loop' or run 'ralph --reset-session' then start again with monitor enabled.";
+  }
+  if (statusName === 'error' || statusName === 'failed') {
+    return 'Inspect latest codex_output/codex_stderr logs and fix the first blocking error.';
+  }
+  if (statusName === 'running' || statusName === 'executing') {
+    return 'No action required. Keep monitoring loop progress and quota.';
+  }
+  return 'Refresh diagnostics and verify status/log artifacts.';
+}
+
+function buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective }) {
+  const ralphDir = path.join(projectPath, '.ralph');
+  const diagnosticsJsonFile = path.join(ralphDir, 'diagnostics_latest.json');
+  const diagnosticsMdFile = path.join(ralphDir, 'diagnostics_latest.md');
+  const diagnosticsJson = safeReadJson(diagnosticsJsonFile);
+  const diagnosticsMarkdown = safeReadText(diagnosticsMdFile);
+  const generatedAt = diagnosticsJson?.generated_at || getFileMtimeIso(diagnosticsMdFile) || null;
+  const generatedAgeSeconds = generatedAt ? Math.max(0, Math.floor((Date.now() - Date.parse(generatedAt)) / 1000)) : null;
+  const staleThreshold = 15 * 60;
+  const isStale = typeof generatedAgeSeconds === 'number' ? generatedAgeSeconds > staleThreshold : true;
+
+  if (diagnosticsJson && typeof diagnosticsJson === 'object') {
+    return {
+      source: 'ralph_diagnostics_json',
+      generatedAt,
+      generatedAgeSeconds,
+      isStale,
+      rootCause:
+        diagnosticsJson?.root_cause ||
+        diagnosticsJson?.rootCause ||
+        deriveDiagnosticRootCause(status, runtime, codexQuotaEffective),
+      recommendation:
+        diagnosticsJson?.recommendation ||
+        deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective),
+      raw: diagnosticsJson,
+      markdownPreview: diagnosticsMarkdown ? diagnosticsMarkdown.split('\n').slice(0, 40).join('\n') : '',
+      files: {
+        json: diagnosticsJsonFile,
+        markdown: diagnosticsMdFile
+      }
+    };
+  }
+
+  return {
+    source: diagnosticsMarkdown ? 'ralph_diagnostics_markdown' : 'derived',
+    generatedAt,
+    generatedAgeSeconds,
+    isStale,
+    rootCause: deriveDiagnosticRootCause(status, runtime, codexQuotaEffective),
+    recommendation: deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective),
+    raw: null,
+    markdownPreview: diagnosticsMarkdown ? diagnosticsMarkdown.split('\n').slice(0, 40).join('\n') : '',
+    files: {
+      json: diagnosticsJsonFile,
+      markdown: diagnosticsMdFile
+    }
+  };
 }
 
 function buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, statusEffectiveQuota) {
@@ -519,6 +639,41 @@ app.get('/api/processes', (_req, res) => {
   res.json({ processes: listRuntimeProcesses() });
 });
 
+function launchRalph({ projectPath, args, ralphScript }) {
+  const logDir = path.join(projectPath, '.ralph', 'logs');
+  fs.mkdirSync(logDir, { recursive: true });
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const logFile = path.join(logDir, `ui_run_${ts}.log`);
+  const command = `${ralphScript} ${args} > '${logFile}' 2>&1`;
+  const child = spawn('bash', ['-lc', command], {
+    cwd: projectPath,
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+
+  return { pid: child.pid, logFile, command };
+}
+
+function refreshRalphDiagnostics({ projectPath }) {
+  const command = `${DEFAULT_RALPH_BIN} --diagnostics`;
+  try {
+    execSync(command, {
+      cwd: projectPath,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8'
+    });
+    return { ok: true, command };
+  } catch (error) {
+    return {
+      ok: false,
+      command,
+      error: error?.stderr?.toString?.().trim?.() || error?.message || 'failed to refresh diagnostics'
+    };
+  }
+}
+
 app.post('/api/run', (req, res) => {
   const {
     projectPath,
@@ -530,22 +685,46 @@ app.post('/api/run', (req, res) => {
     return res.status(400).json({ error: 'projectPath invalido' });
   }
 
-  const logDir = path.join(projectPath, '.ralph', 'logs');
-  fs.mkdirSync(logDir, { recursive: true });
+  const launched = launchRalph({ projectPath, args, ralphScript });
+  return res.json({ started: true, ...launched });
+});
 
-  const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const logFile = path.join(logDir, `ui_run_${ts}.log`);
+app.post('/api/recover', (req, res) => {
+  const {
+    projectPath,
+    args = '--sandbox workspace-write --full-auto --auto-reset-circuit --timeout 20 --calls 30 --verbose',
+    ralphScript = DEFAULT_RALPH_SCRIPT
+  } = req.body || {};
 
-  const command = `${ralphScript} ${args} > '${logFile}' 2>&1`;
-  const child = spawn('bash', ['-lc', command], {
-    cwd: projectPath,
-    detached: true,
-    stdio: 'ignore'
-  });
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
 
-  child.unref();
+  try {
+    execSync('~/.local/bin/ralph --reset-circuit', {
+      cwd: projectPath,
+      stdio: 'ignore',
+      shell: '/bin/bash'
+    });
+  } catch {
+    // best-effort reset
+  }
 
-  return res.json({ started: true, pid: child.pid, logFile, command });
+  const launched = launchRalph({ projectPath, args, ralphScript });
+  return res.json({ recovered: true, ...launched });
+});
+
+app.post('/api/refresh-diagnostics', (req, res) => {
+  const projectPath = req.body?.projectPath;
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
+
+  const refreshed = refreshRalphDiagnostics({ projectPath });
+  if (!refreshed.ok) {
+    return res.status(400).json({ error: refreshed.error, command: refreshed.command });
+  }
+  return res.json({ refreshed: true, command: refreshed.command });
 });
 
 app.post('/api/stop', (req, res) => {
@@ -573,7 +752,7 @@ app.get('/api/project-status', (req, res) => {
   const fixPlanFile = path.join(projectPath, '.ralph', 'fix_plan.md');
   const codexStatusSnapshotFile = path.join(projectPath, '.ralph', 'codex_status_snapshot.txt');
 
-  const status = safeReadJson(statusFile);
+  let status = safeReadJson(statusFile);
   const fixPlan = fs.existsSync(fixPlanFile) ? fs.readFileSync(fixPlanFile, 'utf8') : '';
   const logs = tailFile(logFile, 100);
   const codexQuota = parseCodexQuota(projectPath);
@@ -592,8 +771,27 @@ app.get('/api/project-status', (req, res) => {
   }
 
   const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, status?.codex_quota_effective);
+  const activeStatuses = ['running', 'paused', 'retrying', 'executing'];
   const statusName = String(status?.status || '').toLowerCase();
-  const isTerminalStatus = ['error', 'failed', 'halted', 'stopped', 'completed'].includes(statusName);
+  const appearsOrphaned =
+    status != null &&
+    activeStatuses.includes(statusName) &&
+    processes.length === 0 &&
+    typeof statusAgeSeconds === 'number' &&
+    statusAgeSeconds > RUNTIME_ORPHAN_THRESHOLD_SECONDS;
+
+  if (appearsOrphaned) {
+    status = {
+      ...status,
+      status: 'stopped_unexpected',
+      last_action: 'process_missing',
+      exit_reason: 'process_missing',
+      derived: true
+    };
+  }
+
+  const finalStatusName = String(status?.status || '').toLowerCase();
+  const isTerminalStatus = ['error', 'failed', 'halted', 'stopped', 'completed', 'stopped_unexpected'].includes(finalStatusName);
   const isFresh = typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false;
   const runtime = {
     processesCount: processes.length,
@@ -605,8 +803,32 @@ app.get('/api/project-status', (req, res) => {
       isFresh &&
       !isTerminalStatus
   };
+  const diagnostics = buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective });
+  const cached = getUiCacheRecord(projectPath);
+  const cachedPayload = cached?.payload || null;
+  const payload = {
+    status: status || cachedPayload?.status || null,
+    logs: logs || cachedPayload?.logs || '',
+    fixPlan: fixPlan || cachedPayload?.fixPlan || '',
+    codexQuota: codexQuota || cachedPayload?.codexQuota || null,
+    codexStatusSnapshot: codexStatusSnapshot || cachedPayload?.codexStatusSnapshot || null,
+    codexQuotaEffective:
+      (codexQuotaEffective?.source !== 'none' ? codexQuotaEffective : null) ||
+      cachedPayload?.codexQuotaEffective ||
+      codexQuotaEffective,
+    runtime,
+    diagnostics,
+    processes,
+    cacheUsed: false,
+    cacheUpdatedAt: cached?.updatedAt || null
+  };
 
-  res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot, codexQuotaEffective, runtime, processes });
+  if (!status && cachedPayload?.status) {
+    payload.cacheUsed = true;
+  }
+
+  saveUiCacheRecord(projectPath, payload);
+  res.json(payload);
 });
 
 app.get('/api/export-diagnostics', (req, res) => {
@@ -637,6 +859,8 @@ app.get('/api/export-diagnostics', (req, res) => {
     codexQuota: parseCodexQuota(projectPath),
     codexStatusSnapshot: parseCodexStatusSnapshotText(safeReadText(path.join(ralphDir, 'codex_status_snapshot.txt'))),
     codexQuotaEffective: null,
+    diagnosticsLatestJson: safeReadJson(path.join(ralphDir, 'diagnostics_latest.json')),
+    diagnosticsLatestMarkdown: safeReadText(path.join(ralphDir, 'diagnostics_latest.md')),
     processes: [],
     logs: {
       ralphTail100: tailFile(path.join(logDir, 'ralph.log'), 100),
@@ -674,5 +898,7 @@ module.exports = {
   parseLimitLine,
   parseCodexStatusSnapshotText,
   buildEffectiveQuota,
-  formatResetLabelFromEpoch
+  formatResetLabelFromEpoch,
+  deriveDiagnosticRootCause,
+  deriveDiagnosticRecommendation
 };

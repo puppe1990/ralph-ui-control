@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   Download,
   FolderSearch,
   Gauge,
@@ -36,7 +37,7 @@ function statusVariant(status) {
   if (status === 'running' || status === 'executing') return 'success';
   if (status === 'paused') return 'warning';
   if (status === 'stale') return 'warning';
-  if (status === 'error' || status === 'failed' || status === 'halted') return 'destructive';
+  if (status === 'error' || status === 'failed' || status === 'halted' || status === 'stopped_unexpected') return 'destructive';
   return 'secondary';
 }
 
@@ -101,6 +102,7 @@ export function App() {
   const [codexQuota, setCodexQuota] = useState(null);
   const [codexStatusSnapshot, setCodexStatusSnapshot] = useState(null);
   const [codexQuotaEffective, setCodexQuotaEffective] = useState(null);
+  const [diagnostics, setDiagnostics] = useState(null);
   const [runtime, setRuntime] = useState(null);
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
@@ -131,6 +133,7 @@ export function App() {
       setCodexQuota(data.codexQuota || null);
       setCodexStatusSnapshot(data.codexStatusSnapshot || null);
       setCodexQuotaEffective(data.codexQuotaEffective || null);
+      setDiagnostics(data.diagnostics || null);
       setRuntime(data.runtime || null);
       if (Array.isArray(data.processes)) {
         setProcesses(data.processes);
@@ -160,6 +163,27 @@ export function App() {
       await refreshProject();
     } catch {
       setMessage('Erro ao iniciar Ralph');
+    }
+  }
+
+  async function recoverRalph() {
+    setMessage('Recuperando loop (reset circuit + restart)...');
+    try {
+      const res = await fetch('/api/recover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath, args })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(`Erro ao recuperar: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+      setMessage(`Loop recuperado (PID ${data.pid})`);
+      await refreshProcesses();
+      await refreshProject();
+    } catch {
+      setMessage('Erro ao recuperar loop');
     }
   }
 
@@ -227,6 +251,26 @@ export function App() {
     setMessage('Cota Codex atualizada');
   }
 
+  async function refreshDiagnostics() {
+    setMessage('Atualizando diagnostico do Ralph...');
+    try {
+      const res = await fetch('/api/refresh-diagnostics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(`Erro ao atualizar diagnostico: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+      await refreshProject();
+      setMessage('Diagnostico atualizado');
+    } catch {
+      setMessage('Erro ao atualizar diagnostico');
+    }
+  }
+
   useEffect(() => {
     refreshProcesses();
     refreshProject();
@@ -256,7 +300,10 @@ export function App() {
 
   const headlineStatus = useMemo(() => {
     if (!status?.status) return 'idle';
-    if (runtime && runtime.runtimeHealthy === false) return 'stale';
+    const terminalStatuses = ['error', 'failed', 'halted', 'stopped', 'completed', 'stopped_unexpected'];
+    if (runtime && runtime.runtimeHealthy === false && !terminalStatuses.includes(String(status.status || '').toLowerCase())) {
+      return 'stale';
+    }
     return status.status;
   }, [status, runtime]);
   const fiveHourQuota = codexQuotaEffective?.fiveHour || codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
@@ -297,6 +344,11 @@ export function App() {
     }
     return status?.loop_elapsed_hms ?? '00:00:00';
   }, [status, nowEpoch, isRateLimited]);
+  const diagnosticsAgeLabel = diagnostics?.generatedAgeSeconds != null ? formatAge(diagnostics.generatedAgeSeconds) : '--';
+  const diagnosticsBadgeVariant = diagnostics?.isStale ? 'warning' : 'outline';
+  const diagnosticsRootCause = diagnostics?.rootCause || 'Sem diagnostico consolidado';
+  const diagnosticsRecommendation = diagnostics?.recommendation || 'Atualize o diagnostico para obter recomendacoes.';
+  const diagnosticsSource = diagnostics?.source || 'derived';
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -409,7 +461,7 @@ export function App() {
         </Card>
       </section>
 
-      <section className="mb-6 grid gap-4 lg:grid-cols-5">
+      <section className="mb-6 grid gap-4 lg:grid-cols-7">
         <Card className="lg:col-span-3">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-lg">
@@ -436,8 +488,14 @@ export function App() {
               <Button onClick={startRalph}>
                 <PlayCircle className="h-4 w-4" /> Rodar Ralph
               </Button>
+              <Button variant="secondary" onClick={recoverRalph}>
+                <RefreshCcw className="h-4 w-4" /> Recover Loop
+              </Button>
               <Button variant="secondary" onClick={refreshCodexQuota}>
                 <RefreshCcw className="h-4 w-4" /> Atualizar Cota
+              </Button>
+              <Button variant="secondary" onClick={refreshDiagnostics}>
+                <AlertTriangle className="h-4 w-4" /> Atualizar Diagnostico
               </Button>
               <Button variant="outline" onClick={exportDiagnostics}>
                 <Download className="h-4 w-4" /> Exportar Diagnostico
@@ -452,6 +510,35 @@ export function App() {
 
             <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2 text-sm text-muted-foreground">
               {message || 'Aguardando ação...'}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="lg:col-span-2">
+          <CardHeader>
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <CardTitle className="text-lg">Diagnostico Consolidado</CardTitle>
+                <CardDescription>Causa raiz e proxima acao recomendada.</CardDescription>
+              </div>
+              <Badge variant={diagnosticsBadgeVariant} className="px-3 py-1 text-xs">
+                {diagnostics?.isStale ? 'STALE' : 'FRESH'} ({diagnosticsAgeLabel})
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-md border border-border/70 bg-card/60 p-3">
+              <div className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Root cause</div>
+              <div className="text-sm">{diagnosticsRootCause}</div>
+            </div>
+            <div className="rounded-md border border-border/70 bg-card/60 p-3">
+              <div className="mb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Next action</div>
+              <div className="text-sm">{diagnosticsRecommendation}</div>
+            </div>
+            <div className="grid gap-1 text-xs text-muted-foreground">
+              <div>Source: {diagnosticsSource}</div>
+              <div>Generated: {diagnostics?.generatedAt || '--'}</div>
+              <div>File: {diagnostics?.files?.json || '--'}</div>
             </div>
           </CardContent>
         </Card>

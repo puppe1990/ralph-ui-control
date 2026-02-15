@@ -5,7 +5,9 @@ const {
   parseLimitLine,
   parseCodexStatusSnapshotText,
   buildEffectiveQuota,
-  formatResetLabelFromEpoch
+  formatResetLabelFromEpoch,
+  deriveDiagnosticRootCause,
+  deriveDiagnosticRecommendation
 } = require('./index.js');
 
 test('parseLimitLine converts epoch reset labels to human-readable local label', () => {
@@ -80,4 +82,22 @@ test('formatResetLabelFromEpoch returns null for invalid values', () => {
   assert.equal(formatResetLabelFromEpoch(null), null);
   assert.equal(formatResetLabelFromEpoch('bad'), null);
   assert.equal(formatResetLabelFromEpoch(0), null);
+});
+
+test('deriveDiagnosticRootCause prioritizes api limit signal', () => {
+  const cause = deriveDiagnosticRootCause(
+    { status: 'paused', last_action: 'api_limit', exit_reason: 'api_5hour_limit' },
+    { runtimeHealthy: true },
+    { fiveHour: { remainingPercent: 0 } }
+  );
+  assert.equal(cause, 'Codex 5-hour rate limit reached');
+});
+
+test('deriveDiagnosticRecommendation handles stale runtime', () => {
+  const recommendation = deriveDiagnosticRecommendation(
+    { status: 'running', last_action: 'executing', exit_reason: '' },
+    { runtimeHealthy: false },
+    { fiveHour: { remainingPercent: 50 } }
+  );
+  assert.match(recommendation, /Recover Loop|reset-session/i);
 });
