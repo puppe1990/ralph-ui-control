@@ -838,7 +838,7 @@ export function App() {
                     </Button>
                   </div>
                 </div>
-                <div className="grid gap-2 text-xs md:grid-cols-3">
+                <div className="grid gap-2 text-xs md:grid-cols-5">
                   <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
                     <div className="text-muted-foreground">Loop atual</div>
                     <div className="mt-1 text-sm font-semibold text-slate-100">#{status?.current_loop ?? 0}</div>
@@ -850,6 +850,18 @@ export function App() {
                   <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
                     <div className="text-muted-foreground">Tempo da sessao</div>
                     <div className="mt-1 text-sm font-semibold text-slate-100">{liveSessionElapsed}</div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
+                    <div className="text-muted-foreground">Cota Codex (5h)</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-100">
+                      {fiveHourRemaining != null ? `${fiveHourRemaining}% remaining` : '--'}
+                    </div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
+                    <div className="text-muted-foreground">Cota Codex (Semanal)</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-100">
+                      {weeklyRemaining != null ? `${weeklyRemaining}% remaining` : '--'}
+                    </div>
                   </div>
                 </div>
               </div>
