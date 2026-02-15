@@ -139,12 +139,15 @@ function formatResetLabelFromEpoch(resetEpochSeconds) {
   const epoch = Number(resetEpochSeconds);
   if (!Number.isFinite(epoch) || epoch <= 0) return null;
   const resetDate = new Date(epoch * 1000);
-  const now = new Date();
-  const sameDay = resetDate.toDateString() === now.toDateString();
-  if (sameDay) {
-    return resetDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-  }
-  return resetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZone: timezone
+  }).format(resetDate);
 }
 
 function getQuotaStatusFromRemaining(remainingPercent) {
@@ -189,7 +192,42 @@ function getStatusAgeSeconds(status) {
   return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
 }
 
-function buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits) {
+function buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, statusEffectiveQuota) {
+  const normalizeStatusQuota = (quotaObj, source = 'status_json') => {
+    if (!quotaObj || typeof quotaObj !== 'object') return null;
+    const five = quotaObj.five_hour || quotaObj.fiveHour || {};
+    const weekly = quotaObj.weekly || {};
+    const hasNumbers =
+      typeof five.remaining_percent === 'number' ||
+      typeof five.remainingPercent === 'number' ||
+      typeof weekly.remaining_percent === 'number' ||
+      typeof weekly.remainingPercent === 'number';
+    if (!hasNumbers) return null;
+    return {
+      fiveHour: {
+        status: five.status || 'unknown',
+        remainingPercent: five.remainingPercent ?? five.remaining_percent ?? null,
+        usagePercent: five.usagePercent ?? five.used_percent ?? null,
+        resetLabel: five.resetLabel || five.reset_label_local || formatResetLabelFromEpoch(five.resets_at_epoch),
+        line: ''
+      },
+      weekly: {
+        status: weekly.status || 'unknown',
+        remainingPercent: weekly.remainingPercent ?? weekly.remaining_percent ?? null,
+        usagePercent: weekly.usagePercent ?? weekly.used_percent ?? null,
+        resetLabel: weekly.resetLabel || weekly.reset_label_local || formatResetLabelFromEpoch(weekly.resets_at_epoch),
+        line: ''
+      },
+      updatedAt: new Date().toISOString(),
+      source: quotaObj.source || source
+    };
+  };
+
+  const normalizedStatusQuota = normalizeStatusQuota(statusEffectiveQuota);
+  if (normalizedStatusQuota) {
+    return normalizedStatusQuota;
+  }
+
   const snapshotHasNumbers =
     codexStatusSnapshot &&
     (typeof codexStatusSnapshot?.fiveHour?.remainingPercent === 'number' ||
@@ -545,7 +583,7 @@ app.get('/api/project-status', (req, res) => {
     codexStatusSnapshot.isStale = ageSeconds > 300;
   }
 
-  const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits);
+  const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, status?.codex_quota_effective);
   const runtime = {
     processesCount: processes.length,
     statusAgeSeconds,
@@ -653,7 +691,8 @@ app.get('/api/export-diagnostics', (req, res) => {
   diagnostics.codexQuotaEffective = buildEffectiveQuota(
     diagnostics.codexStatusSnapshot,
     diagnostics.codexQuota,
-    readLatestRateLimitsFromCodexSessions()
+    readLatestRateLimitsFromCodexSessions(),
+    diagnostics.status?.codex_quota_effective
   );
 
   recentLogFiles.forEach((filePath) => {
@@ -666,6 +705,17 @@ app.get('/api/export-diagnostics', (req, res) => {
   return res.send(JSON.stringify(diagnostics, null, 2));
 });
 
-app.listen(PORT, () => {
-  console.log(`Ralph Control API listening on http://localhost:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Ralph Control API listening on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = {
+  app,
+  normalizeStatusLine,
+  parseLimitLine,
+  parseCodexStatusSnapshotText,
+  buildEffectiveQuota,
+  formatResetLabelFromEpoch
+};
