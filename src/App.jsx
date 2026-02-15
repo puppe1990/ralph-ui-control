@@ -39,18 +39,10 @@ function statusVariant(status) {
   return 'secondary';
 }
 
-function getCodexStatus(processes, status) {
-  const codexProcess = processes.find((p) => p.command.includes('codex exec'));
-  if (codexProcess) {
-    return { label: 'running', variant: 'success', detail: `PID ${codexProcess.pid} • ${codexProcess.etime}` };
-  }
-  if (status?.last_action === 'executing') {
-    return { label: 'starting', variant: 'warning', detail: 'Aguardando processo codex aparecer' };
-  }
-  if (status?.status === 'halted' || status?.status === 'error') {
-    return { label: 'error', variant: 'destructive', detail: status?.exit_reason || 'Loop interrompido' };
-  }
-  return { label: 'idle', variant: 'secondary', detail: 'Sem execução ativa' };
+function quotaVariant(status) {
+  if (status === 'ok') return 'success';
+  if (status === 'limited') return 'destructive';
+  return 'secondary';
 }
 
 export function App() {
@@ -58,6 +50,9 @@ export function App() {
   const [args, setArgs] = useState('--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose');
   const [processes, setProcesses] = useState([]);
   const [status, setStatus] = useState(null);
+  const [codexQuota, setCodexQuota] = useState(null);
+  const [codexStatusSnapshot, setCodexStatusSnapshot] = useState(null);
+  const [codexStatusInput, setCodexStatusInput] = useState('');
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
   const [message, setMessage] = useState('');
@@ -81,6 +76,8 @@ export function App() {
         return;
       }
       setStatus(data.status || null);
+      setCodexQuota(data.codexQuota || null);
+      setCodexStatusSnapshot(data.codexStatusSnapshot || null);
       setLogs(data.logs || '');
       setFixPlan(data.fixPlan || '');
     } catch {
@@ -134,8 +131,18 @@ export function App() {
       setMessage('Gerando pacote de diagnostico...');
       const res = await fetch(`/api/export-diagnostics?projectPath=${encodeURIComponent(projectPath)}`);
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        setMessage(`Erro ao exportar: ${data.error || 'falha inesperada'}`);
+        let detail = '';
+        const contentType = res.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const data = await res.json().catch(() => ({}));
+          detail = data.error || '';
+        } else {
+          const raw = await res.text().catch(() => '');
+          detail = raw.includes('Cannot GET /api/export-diagnostics')
+            ? 'API desatualizada: reinicie o backend do Ralph Control UI'
+            : raw.slice(0, 160);
+        }
+        setMessage(`Erro ao exportar (${res.status}): ${detail || 'falha inesperada'}`);
         return;
       }
 
@@ -154,6 +161,25 @@ export function App() {
       setMessage(`Diagnostico exportado: ${fileName}`);
     } catch {
       setMessage('Erro ao exportar diagnostico');
+    }
+  }
+
+  async function saveCodexStatusSnapshot() {
+    try {
+      const res = await fetch('/api/codex-status-snapshot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath, snapshotText: codexStatusInput })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(`Erro ao salvar /status: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+      setMessage('Snapshot do /status salvo com sucesso');
+      await refreshProject();
+    } catch {
+      setMessage('Erro ao salvar snapshot do /status');
     }
   }
 
@@ -176,7 +202,8 @@ export function App() {
     if (!status?.status) return 'idle';
     return status.status;
   }, [status]);
-  const codexStatus = useMemo(() => getCodexStatus(processes, status), [processes, status]);
+  const fiveHourQuota = codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
+  const weeklyQuota = codexStatusSnapshot?.weekly || codexQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -197,9 +224,13 @@ export function App() {
                 <Activity className="mr-1.5 h-3.5 w-3.5" />
                 {headlineStatus.toUpperCase()}
               </Badge>
-              <Badge variant={codexStatus.variant} className="px-3 py-1 text-xs">
+              <Badge variant={quotaVariant(fiveHourQuota.status)} className="px-3 py-1 text-xs">
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
-                CODEX: {codexStatus.label.toUpperCase()}
+                CODEX 5H: {String(fiveHourQuota.status).toUpperCase()}
+              </Badge>
+              <Badge variant={quotaVariant(weeklyQuota.status)} className="px-3 py-1 text-xs">
+                <Terminal className="mr-1.5 h-3.5 w-3.5" />
+                CODEX WEEKLY: {String(weeklyQuota.status).toUpperCase()}
               </Badge>
               <Badge variant="outline" className="px-3 py-1 text-xs">
                 <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {status?.session_elapsed_hms ?? '00:00:00'}
@@ -209,7 +240,7 @@ export function App() {
         </div>
       </section>
 
-      <section className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <section className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-5">
         <Card>
           <CardHeader className="pb-2">
             <CardDescription>Loop Atual</CardDescription>
@@ -246,10 +277,28 @@ export function App() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardDescription>Status do Codex</CardDescription>
-            <CardTitle className="text-2xl">{codexStatus.label}</CardTitle>
+            <CardDescription>Cota Codex (5h)</CardDescription>
+            <CardTitle className="text-2xl">
+              {fiveHourQuota.status}
+              {fiveHourQuota.usagePercent != null ? ` (${fiveHourQuota.usagePercent}%)` : ''}
+            </CardTitle>
           </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">{codexStatus.detail}</CardContent>
+          <CardContent className="text-xs text-muted-foreground">
+            {fiveHourQuota.line || fiveHourQuota.lastSignal || fiveHourQuota.source}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>Cota Codex (Semanal)</CardDescription>
+            <CardTitle className="text-2xl">
+              {weeklyQuota.status}
+              {weeklyQuota.usagePercent != null ? ` (${weeklyQuota.usagePercent}%)` : ''}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-muted-foreground">
+            {weeklyQuota.line || weeklyQuota.lastSignal || weeklyQuota.source}
+          </CardContent>
         </Card>
       </section>
 
@@ -276,9 +325,24 @@ export function App() {
               />
             </div>
 
+            <div className="space-y-2">
+              <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                Snapshot do `/status` (Codex CLI)
+              </label>
+              <Textarea
+                className="min-h-[90px] font-mono text-xs"
+                placeholder="Cole aqui a saida do /status do Codex CLI para extrair cota 5h e semanal..."
+                value={codexStatusInput}
+                onChange={(e) => setCodexStatusInput(e.target.value)}
+              />
+            </div>
+
             <div className="flex flex-wrap gap-2">
               <Button onClick={startRalph}>
                 <PlayCircle className="h-4 w-4" /> Rodar Ralph
+              </Button>
+              <Button variant="secondary" onClick={saveCodexStatusSnapshot}>
+                <Terminal className="h-4 w-4" /> Salvar `/status`
               </Button>
               <Button variant="outline" onClick={exportDiagnostics}>
                 <Download className="h-4 w-4" /> Exportar Diagnostico

@@ -49,6 +49,107 @@ function listRecentLogFiles(logDir, limit = 8) {
   }
 }
 
+function listRecentLogFilesByPrefix(logDir, prefix, limit = 8) {
+  try {
+    return fs
+      .readdirSync(logDir)
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => path.join(logDir, name))
+      .filter((fullPath) => fs.statSync(fullPath).isFile())
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+function parseCodexQuota(projectPath) {
+  const logDir = path.join(projectPath, '.ralph', 'logs');
+  const ralphLog = tailFile(path.join(logDir, 'ralph.log'), 2000);
+  const stderrFiles = listRecentLogFilesByPrefix(logDir, 'codex_stderr_', 8);
+  const stderrText = stderrFiles.map((filePath) => tailFile(filePath, 120)).join('\n');
+  const corpus = `${ralphLog}\n${stderrText}`;
+  const lines = corpus.split('\n').filter(Boolean);
+
+  const fiveHourPatterns = [
+    /5[\s-]?hour/i,
+    /usage limit reached/i,
+    /api usage limit/i,
+    /try again in about an hour/i
+  ];
+  const weeklyPatterns = [
+    /weekly/i,
+    /week(?:ly)?\s+limit/i,
+    /7[\s-]?day/i
+  ];
+
+  const lastMatch = (patterns) => {
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (patterns.some((pattern) => pattern.test(lines[i]))) {
+        return lines[i];
+      }
+    }
+    return '';
+  };
+
+  const fiveHourLine = lastMatch(fiveHourPatterns);
+  const weeklyLine = lastMatch(weeklyPatterns);
+
+  return {
+    fiveHour: {
+      status: fiveHourLine ? 'limited' : 'ok',
+      lastSignal: fiveHourLine || '',
+      source: fiveHourLine ? 'ralph/codex logs' : 'no recent limit signals'
+    },
+    weekly: {
+      status: weeklyLine ? 'limited' : 'unknown',
+      lastSignal: weeklyLine || '',
+      source: weeklyLine ? 'ralph/codex logs' : 'Codex CLI does not expose weekly usage directly in normal flow'
+    },
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function parseCodexStatusSnapshotText(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) {
+    return null;
+  }
+
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const findLine = (patterns) =>
+    lines.find((line) => patterns.some((pattern) => pattern.test(line))) || '';
+
+  const parsePercent = (line) => {
+    const match = /(\d{1,3})\s*%/.exec(line || '');
+    return match ? Number(match[1]) : null;
+  };
+
+  const parseStatus = (line) => {
+    if (!line) return 'unknown';
+    if (/limit|exceeded|blocked|reached/i.test(line)) return 'limited';
+    return 'ok';
+  };
+
+  const fiveHourLine = findLine([/5[\s-]?hour/i, /\b5h\b/i]);
+  const weeklyLine = findLine([/weekly/i, /\bweek\b/i, /7[\s-]?day/i]);
+
+  return {
+    fiveHour: {
+      status: parseStatus(fiveHourLine),
+      usagePercent: parsePercent(fiveHourLine),
+      line: fiveHourLine || ''
+    },
+    weekly: {
+      status: parseStatus(weeklyLine),
+      usagePercent: parsePercent(weeklyLine),
+      line: weeklyLine || ''
+    },
+    updatedAt: new Date().toISOString(),
+    raw: text
+  };
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -131,12 +232,35 @@ app.get('/api/project-status', (req, res) => {
   const statusFile = path.join(projectPath, '.ralph', 'status.json');
   const logFile = path.join(projectPath, '.ralph', 'logs', 'ralph.log');
   const fixPlanFile = path.join(projectPath, '.ralph', 'fix_plan.md');
+  const codexStatusSnapshotFile = path.join(projectPath, '.ralph', 'codex_status_snapshot.txt');
 
   const status = safeReadJson(statusFile);
   const fixPlan = fs.existsSync(fixPlanFile) ? fs.readFileSync(fixPlanFile, 'utf8') : '';
   const logs = tailFile(logFile, 100);
+  const codexQuota = parseCodexQuota(projectPath);
+  const codexStatusSnapshotRaw = safeReadText(codexStatusSnapshotFile);
+  const codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
 
-  res.json({ status, logs, fixPlan });
+  res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot });
+});
+
+app.post('/api/codex-status-snapshot', (req, res) => {
+  const projectPath = req.body?.projectPath;
+  const snapshotText = req.body?.snapshotText || '';
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
+
+  const ralphDir = path.join(projectPath, '.ralph');
+  fs.mkdirSync(ralphDir, { recursive: true });
+  const snapshotFile = path.join(ralphDir, 'codex_status_snapshot.txt');
+  fs.writeFileSync(snapshotFile, String(snapshotText), 'utf8');
+
+  return res.json({
+    saved: true,
+    file: snapshotFile,
+    parsed: parseCodexStatusSnapshotText(snapshotText)
+  });
 });
 
 app.get('/api/export-diagnostics', (req, res) => {
@@ -164,6 +288,8 @@ app.get('/api/export-diagnostics', (req, res) => {
     fixPlan: safeReadText(fixPlanFile),
     sessionId: safeReadText(sessionFile).trim(),
     responseAnalysis: safeReadText(responseAnalysisFile),
+    codexQuota: parseCodexQuota(projectPath),
+    codexStatusSnapshot: parseCodexStatusSnapshotText(safeReadText(path.join(ralphDir, 'codex_status_snapshot.txt'))),
     processes: [],
     logs: {
       ralphTail100: tailFile(path.join(logDir, 'ralph.log'), 100),
