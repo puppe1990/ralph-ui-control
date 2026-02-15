@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  Download,
   FolderSearch,
   Gauge,
   PlayCircle,
@@ -36,6 +37,20 @@ function statusVariant(status) {
   if (status === 'paused') return 'warning';
   if (status === 'error' || status === 'failed' || status === 'halted') return 'destructive';
   return 'secondary';
+}
+
+function getCodexStatus(processes, status) {
+  const codexProcess = processes.find((p) => p.command.includes('codex exec'));
+  if (codexProcess) {
+    return { label: 'running', variant: 'success', detail: `PID ${codexProcess.pid} • ${codexProcess.etime}` };
+  }
+  if (status?.last_action === 'executing') {
+    return { label: 'starting', variant: 'warning', detail: 'Aguardando processo codex aparecer' };
+  }
+  if (status?.status === 'halted' || status?.status === 'error') {
+    return { label: 'error', variant: 'destructive', detail: status?.exit_reason || 'Loop interrompido' };
+  }
+  return { label: 'idle', variant: 'secondary', detail: 'Sem execução ativa' };
 }
 
 export function App() {
@@ -114,6 +129,34 @@ export function App() {
     }
   }
 
+  async function exportDiagnostics() {
+    try {
+      setMessage('Gerando pacote de diagnostico...');
+      const res = await fetch(`/api/export-diagnostics?projectPath=${encodeURIComponent(projectPath)}`);
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setMessage(`Erro ao exportar: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+
+      const blob = await res.blob();
+      const contentDisposition = res.headers.get('Content-Disposition') || '';
+      const match = /filename=\"?([^\";]+)\"?/i.exec(contentDisposition);
+      const fileName = match?.[1] || `ralph-diagnostics-${Date.now()}.json`;
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      setMessage(`Diagnostico exportado: ${fileName}`);
+    } catch {
+      setMessage('Erro ao exportar diagnostico');
+    }
+  }
+
   useEffect(() => {
     refreshProcesses();
     refreshProject();
@@ -133,6 +176,7 @@ export function App() {
     if (!status?.status) return 'idle';
     return status.status;
   }, [status]);
+  const codexStatus = useMemo(() => getCodexStatus(processes, status), [processes, status]);
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -152,6 +196,10 @@ export function App() {
               <Badge variant={statusVariant(headlineStatus)} className="px-3 py-1 text-xs">
                 <Activity className="mr-1.5 h-3.5 w-3.5" />
                 {headlineStatus.toUpperCase()}
+              </Badge>
+              <Badge variant={codexStatus.variant} className="px-3 py-1 text-xs">
+                <Terminal className="mr-1.5 h-3.5 w-3.5" />
+                CODEX: {codexStatus.label.toUpperCase()}
               </Badge>
               <Badge variant="outline" className="px-3 py-1 text-xs">
                 <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {status?.session_elapsed_hms ?? '00:00:00'}
@@ -195,6 +243,14 @@ export function App() {
           </CardHeader>
           <CardContent className="text-xs text-muted-foreground">Limite configurado no loop atual</CardContent>
         </Card>
+
+        <Card>
+          <CardHeader className="pb-2">
+            <CardDescription>Status do Codex</CardDescription>
+            <CardTitle className="text-2xl">{codexStatus.label}</CardTitle>
+          </CardHeader>
+          <CardContent className="text-xs text-muted-foreground">{codexStatus.detail}</CardContent>
+        </Card>
       </section>
 
       <section className="mb-6 grid gap-4 lg:grid-cols-5">
@@ -223,6 +279,9 @@ export function App() {
             <div className="flex flex-wrap gap-2">
               <Button onClick={startRalph}>
                 <PlayCircle className="h-4 w-4" /> Rodar Ralph
+              </Button>
+              <Button variant="outline" onClick={exportDiagnostics}>
+                <Download className="h-4 w-4" /> Exportar Diagnostico
               </Button>
               <Button variant="secondary" onClick={refreshProject}>
                 <RefreshCcw className="h-4 w-4" /> Atualizar Status

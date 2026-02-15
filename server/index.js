@@ -28,6 +28,27 @@ function tailFile(filePath, lines = 80) {
   }
 }
 
+function safeReadText(filePath) {
+  try {
+    return fs.readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function listRecentLogFiles(logDir, limit = 8) {
+  try {
+    return fs
+      .readdirSync(logDir)
+      .map((name) => path.join(logDir, name))
+      .filter((fullPath) => fs.statSync(fullPath).isFile())
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -116,6 +137,70 @@ app.get('/api/project-status', (req, res) => {
   const logs = tailFile(logFile, 100);
 
   res.json({ status, logs, fixPlan });
+});
+
+app.get('/api/export-diagnostics', (req, res) => {
+  const projectPath = req.query.projectPath;
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
+
+  const ralphDir = path.join(projectPath, '.ralph');
+  const logDir = path.join(ralphDir, 'logs');
+  const statusFile = path.join(ralphDir, 'status.json');
+  const fixPlanFile = path.join(ralphDir, 'fix_plan.md');
+  const sessionFile = path.join(ralphDir, '.codex_session_id');
+  const responseAnalysisFile = path.join(ralphDir, '.response_analysis');
+  const recentLogFiles = listRecentLogFiles(logDir, 10);
+
+  const diagnostics = {
+    exportedAt: new Date().toISOString(),
+    projectPath,
+    environment: {
+      node: process.version,
+      platform: process.platform
+    },
+    status: safeReadJson(statusFile),
+    fixPlan: safeReadText(fixPlanFile),
+    sessionId: safeReadText(sessionFile).trim(),
+    responseAnalysis: safeReadText(responseAnalysisFile),
+    processes: [],
+    logs: {
+      ralphTail100: tailFile(path.join(logDir, 'ralph.log'), 100),
+      recentFiles: {}
+    }
+  };
+
+  try {
+    const output = execSync("ps -axo pid,ppid,etime,command | grep -E 'ralph_loop.sh|ralph --|codex exec' | grep -v grep", {
+      encoding: 'utf8'
+    });
+
+    diagnostics.processes = output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const parts = line.split(/\s+/);
+        return {
+          pid: Number(parts[0]),
+          ppid: Number(parts[1]),
+          etime: parts[2],
+          command: parts.slice(3).join(' ')
+        };
+      });
+  } catch {
+    diagnostics.processes = [];
+  }
+
+  recentLogFiles.forEach((filePath) => {
+    diagnostics.logs.recentFiles[path.basename(filePath)] = tailFile(filePath, 120);
+  });
+
+  const fileName = `ralph-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename=\"${fileName}\"`);
+  return res.send(JSON.stringify(diagnostics, null, 2));
 });
 
 app.listen(PORT, () => {

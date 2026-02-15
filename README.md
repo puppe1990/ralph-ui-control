@@ -1,15 +1,19 @@
 # Ralph Control UI
 
-UI em React para monitorar processos do Ralph/Codex e iniciar/parar execuções direto da interface.
+React UI to monitor Ralph/Codex processes and start/stop runs directly from the interface.
 
-## Recursos
+## Features
 
-- Ver processos ativos (`ralph_loop.sh`, `ralph --`, `codex exec`)
-- Rodar Ralph em um projeto com argumentos customizados
-- Parar processo por PID
-- Visualizar `status.json`, `ralph.log` e `fix_plan.md`
+- View active processes (`ralph_loop.sh`, `ralph --`, `codex exec`)
+- Run Ralph in a target project with custom arguments
+- Stop a process by PID
+- Inspect `status.json`, `ralph.log`, and `fix_plan.md`
 
-## Uso
+## Screenshot
+
+![Ralph Control UI](docs/assets/ui-screenshot.png)
+
+## Usage
 
 ```bash
 npm install
@@ -19,8 +23,8 @@ npm run dev
 - Frontend: http://localhost:5173
 - API: http://localhost:3001
 
-## Observações
+## Notes
 
-- Por padrão, o backend usa:
+- By default, the backend uses:
   - script: `/Users/matheuspuppe/Desktop/Projetos/github/ralph-codex/ralph_loop.sh`
-- Para funcionar, o projeto alvo precisa ter `.ralph/` habilitado.
+- To work properly, the target project must have `.ralph/` enabled.
