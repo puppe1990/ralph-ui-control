@@ -120,6 +120,78 @@ function getLogLineClass(level) {
   }
 }
 
+function getLogEventKind(line) {
+  const text = String(line || '').toLowerCase();
+  if (!text.trim()) return 'empty';
+  if (
+    text.includes('permission denied') ||
+    text.includes('timed out') ||
+    text.includes('execution failed') ||
+    text.includes('non-ignorable diagnostics') ||
+    text.includes('❌')
+  ) return 'failure';
+  if (
+    text.includes('rate limit') ||
+    text.includes('api usage limit') ||
+    text.includes('circuit breaker') ||
+    text.includes('retrying in')
+  ) return 'limiter';
+  if (
+    text.includes('session reset') ||
+    text.includes('starting new codex session') ||
+    text.includes('resuming codex thread') ||
+    text.includes('resume strategy')
+  ) return 'session';
+  if (
+    text.includes('=== starting loop') ||
+    text.includes('=== completed loop') ||
+    text.includes('executing codex cli') ||
+    text.includes('starting main loop') ||
+    text.includes('loop #')
+  ) return 'loop';
+  if (
+    text.includes('codex progress:') ||
+    text.includes('codex working')
+  ) return 'progress';
+  if (
+    text.includes('quota snapshot') ||
+    text.includes('codex quota')
+  ) return 'quota';
+  if (
+    text.includes('analyzing codex response') ||
+    text.includes('real code progress')
+  ) return 'analysis';
+  if (
+    text.includes('execution completed successfully') ||
+    text.includes('saved codex thread') ||
+    text.includes('✅')
+  ) return 'success';
+  return 'default';
+}
+
+function getLogEventClass(kind) {
+  switch (kind) {
+    case 'failure':
+      return 'bg-red-500/10 border-l-2 border-red-400/70';
+    case 'limiter':
+      return 'bg-amber-500/10 border-l-2 border-amber-400/70';
+    case 'session':
+      return 'bg-cyan-500/10 border-l-2 border-cyan-300/70';
+    case 'loop':
+      return 'bg-violet-500/10 border-l-2 border-violet-300/70';
+    case 'progress':
+      return 'bg-sky-500/10 border-l-2 border-sky-300/70';
+    case 'quota':
+      return 'bg-teal-500/10 border-l-2 border-teal-300/70';
+    case 'analysis':
+      return 'bg-fuchsia-500/10 border-l-2 border-fuchsia-300/70';
+    case 'success':
+      return 'bg-emerald-500/10 border-l-2 border-emerald-300/70';
+    default:
+      return '';
+  }
+}
+
 export function App() {
   const [projectPath, setProjectPath] = useState(DEFAULT_PROJECT);
   const [args, setArgs] = useState('--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose');
@@ -136,7 +208,20 @@ export function App() {
   const [nowEpoch, setNowEpoch] = useState(() => Math.floor(Date.now() / 1000));
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
   const [logsFullscreen, setLogsFullscreen] = useState(false);
+  const [toast, setToast] = useState(null);
   const logsRef = useRef(null);
+  const toastTimeoutRef = useRef(null);
+
+  function showToast({ title, description, variant = 'success', durationMs = 2200 }) {
+    if (toastTimeoutRef.current) {
+      clearTimeout(toastTimeoutRef.current);
+    }
+    setToast({ title, description, variant });
+    toastTimeoutRef.current = setTimeout(() => {
+      setToast(null);
+      toastTimeoutRef.current = null;
+    }, durationMs);
+  }
 
   async function refreshProcesses() {
     try {
@@ -302,8 +387,19 @@ export function App() {
     try {
       await navigator.clipboard.writeText(String(logs || ''));
       setMessage('Logs copiados para a area de transferencia');
+      showToast({
+        title: 'Logs copied',
+        description: 'The ralph.log content is now in your clipboard.',
+        variant: 'success'
+      });
     } catch {
       setMessage('Erro ao copiar logs');
+      showToast({
+        title: 'Copy failed',
+        description: 'Could not copy logs to clipboard.',
+        variant: 'error',
+        durationMs: 2600
+      });
     }
   }
 
@@ -328,6 +424,14 @@ export function App() {
     if (!logsAutoScroll || !logsRef.current) return;
     logsRef.current.scrollTop = logsRef.current.scrollHeight;
   }, [logs, logsAutoScroll]);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) {
+        clearTimeout(toastTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!logsFullscreen) return;
@@ -683,12 +787,13 @@ export function App() {
               ref={logsRef}
               className="log-surface max-h-[420px] overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200"
             >
-              {logs
-                ? logLines.map((line, index) => {
+                {logs
+                  ? logLines.map((line, index) => {
                     const level = getLogLevel(line);
+                    const kind = getLogEventKind(line);
                     return (
                       <React.Fragment key={`log-line-${index}`}>
-                        <span className={getLogLineClass(level)}>{line}</span>
+                        <span className={`rounded px-1 ${getLogLineClass(level)} ${getLogEventClass(kind)}`}>{line}</span>
                         {index < logLines.length - 1 ? '\n' : ''}
                       </React.Fragment>
                     );
@@ -714,22 +819,38 @@ export function App() {
         <div className="fixed inset-0 z-50 bg-background/95 p-4 md:p-6">
           <Card className="h-full">
             <CardHeader>
-              <div className="flex items-center justify-between gap-3">
-                <CardTitle className="text-lg">Logs (`ralph.log`) - Fullscreen</CardTitle>
-                <div className="flex items-center gap-2">
-                  <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
-                    Copiar logs
-                  </Button>
-                  <Button
-                    variant={logsAutoScroll ? 'secondary' : 'outline'}
-                    size="sm"
-                    onClick={() => setLogsAutoScroll((prev) => !prev)}
-                  >
-                    {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={() => setLogsFullscreen(false)}>
-                    <Minimize2 className="h-3.5 w-3.5" /> Fechar
-                  </Button>
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between gap-3">
+                  <CardTitle className="text-lg">Logs (`ralph.log`) - Fullscreen</CardTitle>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
+                      Copiar logs
+                    </Button>
+                    <Button
+                      variant={logsAutoScroll ? 'secondary' : 'outline'}
+                      size="sm"
+                      onClick={() => setLogsAutoScroll((prev) => !prev)}
+                    >
+                      {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => setLogsFullscreen(false)}>
+                      <Minimize2 className="h-3.5 w-3.5" /> Fechar
+                    </Button>
+                  </div>
+                </div>
+                <div className="grid gap-2 text-xs md:grid-cols-3">
+                  <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
+                    <div className="text-muted-foreground">Loop atual</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-100">#{status?.current_loop ?? 0}</div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
+                    <div className="text-muted-foreground">Timer do loop</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-100">{liveLoopElapsed}</div>
+                  </div>
+                  <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
+                    <div className="text-muted-foreground">Tempo da sessao</div>
+                    <div className="mt-1 text-sm font-semibold text-slate-100">{liveSessionElapsed}</div>
+                  </div>
                 </div>
               </div>
             </CardHeader>
@@ -741,9 +862,10 @@ export function App() {
                 {logs
                   ? logLines.map((line, index) => {
                       const level = getLogLevel(line);
+                      const kind = getLogEventKind(line);
                       return (
                         <React.Fragment key={`log-line-fs-${index}`}>
-                          <span className={getLogLineClass(level)}>{line}</span>
+                          <span className={`rounded px-1 ${getLogLineClass(level)} ${getLogEventClass(kind)}`}>{line}</span>
                           {index < logLines.length - 1 ? '\n' : ''}
                         </React.Fragment>
                       );
@@ -752,6 +874,15 @@ export function App() {
               </pre>
             </CardContent>
           </Card>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed right-4 top-4 z-[60] w-[320px] rounded-lg border border-border/70 bg-card/95 p-3 shadow-2xl backdrop-blur">
+          <div className={`text-sm font-semibold ${toast.variant === 'error' ? 'text-red-300' : 'text-emerald-300'}`}>
+            {toast.title}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">{toast.description}</div>
         </div>
       )}
     </main>
