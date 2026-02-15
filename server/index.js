@@ -113,6 +113,11 @@ function parseLimitLine(line) {
   const isLimitedByText = /(limit reached|rate limit reached|exceeded|blocked|no .*left|\b0\s*%\s*left\b)/i.test(normalized);
   const isLimited = isLimitedByText || remainingPercent === 0;
 
+  const resetEpoch = Number(resetLabel);
+  if (Number.isFinite(resetEpoch) && resetEpoch > 0) {
+    resetLabel = formatResetLabelFromEpoch(resetEpoch);
+  }
+
   return {
     status: isLimited ? 'limited' : 'ok',
     usagePercent,
@@ -147,6 +152,92 @@ function getQuotaStatusFromRemaining(remainingPercent) {
   if (remainingPercent <= 0) return 'limited';
   if (remainingPercent <= 10) return 'warning';
   return 'ok';
+}
+
+function parseProcessTable(output) {
+  return String(output || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split(/\s+/);
+      return {
+        pid: Number(parts[0]),
+        ppid: Number(parts[1]),
+        etime: parts[2],
+        command: parts.slice(3).join(' ')
+      };
+    });
+}
+
+function listRuntimeProcesses() {
+  try {
+    const output = execSync("ps -axo pid,ppid,etime,command | grep -E 'ralph_loop.sh|ralph --|codex exec' | grep -v grep", {
+      encoding: 'utf8'
+    });
+    return parseProcessTable(output);
+  } catch {
+    return [];
+  }
+}
+
+function getStatusAgeSeconds(status) {
+  const ts = status?.timestamp;
+  if (!ts) return null;
+  const parsed = Date.parse(ts);
+  if (Number.isNaN(parsed)) return null;
+  return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+}
+
+function buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits) {
+  const snapshotHasNumbers =
+    codexStatusSnapshot &&
+    (typeof codexStatusSnapshot?.fiveHour?.remainingPercent === 'number' ||
+      typeof codexStatusSnapshot?.weekly?.remainingPercent === 'number');
+
+  if (snapshotHasNumbers && !codexStatusSnapshot?.isStale) {
+    return {
+      ...codexStatusSnapshot,
+      source: codexStatusSnapshot?.source || 'snapshot'
+    };
+  }
+
+  if (sessionRateLimits) {
+    return {
+      fiveHour: {
+        status: getQuotaStatusFromRemaining(sessionRateLimits.fiveHour?.remainingPercent),
+        remainingPercent: sessionRateLimits.fiveHour?.remainingPercent ?? null,
+        usagePercent: sessionRateLimits.fiveHour?.usagePercent ?? null,
+        resetLabel: sessionRateLimits.fiveHour?.resetLabel ?? null,
+        line: ''
+      },
+      weekly: {
+        status: getQuotaStatusFromRemaining(sessionRateLimits.weekly?.remainingPercent),
+        remainingPercent: sessionRateLimits.weekly?.remainingPercent ?? null,
+        usagePercent: sessionRateLimits.weekly?.usagePercent ?? null,
+        resetLabel: sessionRateLimits.weekly?.resetLabel ?? null,
+        line: ''
+      },
+      updatedAt: new Date().toISOString(),
+      source: 'codex_sessions'
+    };
+  }
+
+  if (codexQuota) {
+    return {
+      fiveHour: codexQuota.fiveHour || { status: 'unknown' },
+      weekly: codexQuota.weekly || { status: 'unknown' },
+      updatedAt: codexQuota.updatedAt || new Date().toISOString(),
+      source: 'heuristics_logs'
+    };
+  }
+
+  return {
+    fiveHour: { status: 'unknown' },
+    weekly: { status: 'unknown' },
+    updatedAt: new Date().toISOString(),
+    source: 'none'
+  };
 }
 
 function listRecentCodexSessionFiles(limit = 30) {
@@ -328,8 +419,10 @@ function parseCodexStatusSnapshotText(rawText) {
     const weeklyRemaining = parseNum(kvMatches['weekly_remaining_percent']);
     const weeklyUsed = parseNum(kvMatches['weekly_used_percent']);
 
-    const fiveReset = kvMatches['5h_resets_at'] || null;
-    const weeklyReset = kvMatches['weekly_resets_at'] || null;
+    const fiveResetRaw = kvMatches['5h_resets_at'] || null;
+    const weeklyResetRaw = kvMatches['weekly_resets_at'] || null;
+    const fiveReset = fiveResetRaw ? formatResetLabelFromEpoch(fiveResetRaw) || fiveResetRaw : null;
+    const weeklyReset = weeklyResetRaw ? formatResetLabelFromEpoch(weeklyResetRaw) || weeklyResetRaw : null;
 
     return {
       fiveHour: {
@@ -377,29 +470,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/processes', (_req, res) => {
-  try {
-    const output = execSync("ps -axo pid,ppid,etime,command | grep -E 'ralph_loop.sh|ralph --|codex exec' | grep -v grep", {
-      encoding: 'utf8'
-    });
-
-    const processes = output
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const parts = line.split(/\s+/);
-        return {
-          pid: Number(parts[0]),
-          ppid: Number(parts[1]),
-          etime: parts[2],
-          command: parts.slice(3).join(' ')
-        };
-      });
-
-    res.json({ processes });
-  } catch {
-    res.json({ processes: [] });
-  }
+  res.json({ processes: listRuntimeProcesses() });
 });
 
 app.post('/api/run', (req, res) => {
@@ -460,37 +531,12 @@ app.get('/api/project-status', (req, res) => {
   const fixPlan = fs.existsSync(fixPlanFile) ? fs.readFileSync(fixPlanFile, 'utf8') : '';
   const logs = tailFile(logFile, 100);
   const codexQuota = parseCodexQuota(projectPath);
+  const processes = listRuntimeProcesses();
   const codexStatusSnapshotRaw = safeReadText(codexStatusSnapshotFile);
   let codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
   const snapshotCapturedAt = getFileMtimeIso(codexStatusSnapshotFile);
   const sessionRateLimits = readLatestRateLimitsFromCodexSessions();
-
-  const snapshotHasNumbers =
-    codexStatusSnapshot &&
-    (typeof codexStatusSnapshot?.fiveHour?.remainingPercent === 'number' ||
-      typeof codexStatusSnapshot?.weekly?.remainingPercent === 'number');
-
-  if (!snapshotHasNumbers && sessionRateLimits) {
-    codexStatusSnapshot = {
-      fiveHour: {
-        status: getQuotaStatusFromRemaining(sessionRateLimits.fiveHour?.remainingPercent),
-        remainingPercent: sessionRateLimits.fiveHour?.remainingPercent ?? null,
-        usagePercent: sessionRateLimits.fiveHour?.usagePercent ?? null,
-        resetLabel: sessionRateLimits.fiveHour?.resetLabel ?? null,
-        line: ''
-      },
-      weekly: {
-        status: getQuotaStatusFromRemaining(sessionRateLimits.weekly?.remainingPercent),
-        remainingPercent: sessionRateLimits.weekly?.remainingPercent ?? null,
-        usagePercent: sessionRateLimits.weekly?.usagePercent ?? null,
-        resetLabel: sessionRateLimits.weekly?.resetLabel ?? null,
-        line: ''
-      },
-      updatedAt: new Date().toISOString(),
-      source: 'codex_sessions_fallback',
-      raw: codexStatusSnapshotRaw || ''
-    };
-  }
+  const statusAgeSeconds = getStatusAgeSeconds(status);
 
   if (codexStatusSnapshot && snapshotCapturedAt) {
     const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(snapshotCapturedAt)) / 1000));
@@ -499,7 +545,19 @@ app.get('/api/project-status', (req, res) => {
     codexStatusSnapshot.isStale = ageSeconds > 300;
   }
 
-  res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot });
+  const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits);
+  const runtime = {
+    processesCount: processes.length,
+    statusAgeSeconds,
+    statusFresh: typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false,
+    runtimeHealthy:
+      processes.length > 0 &&
+      status != null &&
+      ['running', 'paused', 'retrying'].includes(String(status.status || '').toLowerCase()) &&
+      (typeof statusAgeSeconds === 'number' ? statusAgeSeconds <= 30 : false)
+  };
+
+  res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot, codexQuotaEffective, runtime, processes });
 });
 
 app.post('/api/codex-status-snapshot', (req, res) => {
@@ -583,6 +641,7 @@ app.get('/api/export-diagnostics', (req, res) => {
     responseAnalysis: safeReadText(responseAnalysisFile),
     codexQuota: parseCodexQuota(projectPath),
     codexStatusSnapshot: parseCodexStatusSnapshotText(safeReadText(path.join(ralphDir, 'codex_status_snapshot.txt'))),
+    codexQuotaEffective: null,
     processes: [],
     logs: {
       ralphTail100: tailFile(path.join(logDir, 'ralph.log'), 100),
@@ -590,27 +649,12 @@ app.get('/api/export-diagnostics', (req, res) => {
     }
   };
 
-  try {
-    const output = execSync("ps -axo pid,ppid,etime,command | grep -E 'ralph_loop.sh|ralph --|codex exec' | grep -v grep", {
-      encoding: 'utf8'
-    });
-
-    diagnostics.processes = output
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const parts = line.split(/\s+/);
-        return {
-          pid: Number(parts[0]),
-          ppid: Number(parts[1]),
-          etime: parts[2],
-          command: parts.slice(3).join(' ')
-        };
-      });
-  } catch {
-    diagnostics.processes = [];
-  }
+  diagnostics.processes = listRuntimeProcesses();
+  diagnostics.codexQuotaEffective = buildEffectiveQuota(
+    diagnostics.codexStatusSnapshot,
+    diagnostics.codexQuota,
+    readLatestRateLimitsFromCodexSessions()
+  );
 
   recentLogFiles.forEach((filePath) => {
     diagnostics.logs.recentFiles[path.basename(filePath)] = tailFile(filePath, 120);

@@ -35,6 +35,7 @@ const DEFAULT_PROJECT = '/Users/matheuspuppe/Desktop/Projetos/github/browser-sql
 function statusVariant(status) {
   if (status === 'running' || status === 'executing') return 'success';
   if (status === 'paused') return 'warning';
+  if (status === 'stale') return 'warning';
   if (status === 'error' || status === 'failed' || status === 'halted') return 'destructive';
   return 'secondary';
 }
@@ -99,6 +100,8 @@ export function App() {
   const [status, setStatus] = useState(null);
   const [codexQuota, setCodexQuota] = useState(null);
   const [codexStatusSnapshot, setCodexStatusSnapshot] = useState(null);
+  const [codexQuotaEffective, setCodexQuotaEffective] = useState(null);
+  const [runtime, setRuntime] = useState(null);
   const [codexStatusInput, setCodexStatusInput] = useState('');
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
@@ -128,6 +131,11 @@ export function App() {
       setStatus(data.status || null);
       setCodexQuota(data.codexQuota || null);
       setCodexStatusSnapshot(data.codexStatusSnapshot || null);
+      setCodexQuotaEffective(data.codexQuotaEffective || null);
+      setRuntime(data.runtime || null);
+      if (Array.isArray(data.processes)) {
+        setProcesses(data.processes);
+      }
       setLogs(data.logs || '');
       setFixPlan(data.fixPlan || '');
     } catch {
@@ -287,10 +295,11 @@ export function App() {
 
   const headlineStatus = useMemo(() => {
     if (!status?.status) return 'idle';
+    if (runtime && runtime.runtimeHealthy === false) return 'stale';
     return status.status;
-  }, [status]);
-  const fiveHourQuota = codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
-  const weeklyQuota = codexStatusSnapshot?.weekly || codexQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
+  }, [status, runtime]);
+  const fiveHourQuota = codexQuotaEffective?.fiveHour || codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
+  const weeklyQuota = codexQuotaEffective?.weekly || codexStatusSnapshot?.weekly || codexQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
   const hasSnapshot = Boolean(codexStatusSnapshot?.capturedAt);
   const fiveHourRemaining = getRemainingPercent(fiveHourQuota);
   const weeklyRemaining = getRemainingPercent(weeklyQuota);
@@ -360,6 +369,11 @@ export function App() {
                   Snapshot /status: {codexStatusSnapshot?.isStale ? 'STALE' : 'FRESH'} ({snapshotAgeLabel} ago)
                 </Badge>
               )}
+              {runtime && (
+                <Badge variant={runtime.runtimeHealthy ? 'outline' : 'destructive'} className="px-3 py-1 text-xs">
+                  Runtime: {runtime.runtimeHealthy ? 'HEALTHY' : 'STALE/OFFLINE'}
+                </Badge>
+              )}
               <Badge variant={isRateLimited ? 'warning' : 'outline'} className="px-3 py-1 text-xs">
                 <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {liveSessionElapsed}
                 {isRateLimited ? ' (paused)' : ''}
@@ -416,7 +430,7 @@ export function App() {
           </CardHeader>
           <CardContent className="space-y-1 text-xs text-muted-foreground">
             <div>Reset: {fiveHourQuota.resetLabel || '--'}</div>
-            <div>Source: {hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics'}</div>
+            <div>Source: {codexQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
           </CardContent>
         </Card>
 
@@ -429,7 +443,7 @@ export function App() {
           </CardHeader>
           <CardContent className="space-y-1 text-xs text-muted-foreground">
             <div>Reset: {weeklyQuota.resetLabel || '--'}</div>
-            <div>Source: {hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics'}</div>
+            <div>Source: {codexQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
           </CardContent>
         </Card>
       </section>
