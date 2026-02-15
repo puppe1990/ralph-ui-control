@@ -242,18 +242,35 @@ function selectFolderPath(platform = process.platform) {
   let status = 0;
 
   if (platform === 'darwin') {
-    const script = 'POSIX path of (choose folder with prompt "Select a project folder for Ralph Control UI")';
+    const script = [
+      'try',
+      'set chosenFolder to choose folder with prompt "Select a project folder for Ralph Control UI"',
+      'return POSIX path of chosenFolder',
+      'on error number -128',
+      'return "__CANCELED__"',
+      'end try'
+    ].join('\n');
     const result = spawnSync('osascript', ['-e', script], { encoding: 'utf8' });
+    if (result.error) {
+      const failure = new Error(result.error.message || 'failed to execute osascript');
+      failure.code = 'FAILED';
+      throw failure;
+    }
     stdout = result.stdout || '';
     stderr = result.stderr || '';
-    status = result.status ?? 0;
+    status = typeof result.status === 'number' ? result.status : 1;
   } else if (platform === 'linux') {
     const result = spawnSync('zenity', ['--file-selection', '--directory', '--title=Select a project folder for Ralph Control UI'], {
       encoding: 'utf8'
     });
+    if (result.error) {
+      const failure = new Error(result.error.message || 'failed to execute zenity');
+      failure.code = 'FAILED';
+      throw failure;
+    }
     stdout = result.stdout || '';
     stderr = result.stderr || '';
-    status = result.status ?? 0;
+    status = typeof result.status === 'number' ? result.status : 1;
   } else if (platform === 'win32') {
     const script = [
       'Add-Type -AssemblyName System.Windows.Forms',
@@ -268,9 +285,14 @@ function selectFolderPath(platform = process.platform) {
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
       { encoding: 'utf8' }
     );
+    if (result.error) {
+      const failure = new Error(result.error.message || 'failed to execute powershell');
+      failure.code = 'FAILED';
+      throw failure;
+    }
     stdout = result.stdout || '';
     stderr = result.stderr || '';
-    status = result.status ?? 0;
+    status = typeof result.status === 'number' ? result.status : 1;
   } else {
     const unsupported = new Error(`Folder picker not supported on platform: ${platform}`);
     unsupported.code = 'UNSUPPORTED';
@@ -287,6 +309,12 @@ function selectFolderPath(platform = process.platform) {
     const failure = new Error((stderr || stdout || 'failed to select folder').trim());
     failure.code = 'FAILED';
     throw failure;
+  }
+
+  if (String(stdout).trim() === '__CANCELED__') {
+    const canceled = new Error('Folder selection canceled');
+    canceled.code = 'CANCELED';
+    throw canceled;
   }
 
   const selectedPath = normalizeSelectedFolderPath(stdout);

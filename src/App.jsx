@@ -356,8 +356,17 @@ export function App() {
     setMessage('Abrindo seletor de pasta...');
     try {
       const res = await fetch('/api/select-folder');
-      const data = await res.json().catch(() => ({}));
+      const contentType = res.headers.get('content-type') || '';
+      const isJson = contentType.includes('application/json');
+      const data = isJson ? await res.json().catch(() => ({})) : {};
       if (!res.ok) {
+        if (!isJson) {
+          const raw = await res.text().catch(() => '');
+          if (raw.includes('Cannot GET /api/select-folder')) {
+            setMessage('API desatualizada: reinicie o backend do Ralph Control UI');
+            return;
+          }
+        }
         if (data?.canceled) {
           setMessage('Selecao de pasta cancelada');
         } else {
