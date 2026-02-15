@@ -81,6 +81,17 @@ function formatAge(seconds) {
   return `${h}h ${remM}m`;
 }
 
+function getApiLimitRemainingSeconds(status, nowEpoch) {
+  if (!status) return 0;
+  if (typeof status.api_limit_wait_remaining_seconds === 'number' && status.api_limit_wait_remaining_seconds > 0) {
+    return status.api_limit_wait_remaining_seconds;
+  }
+  if (status.api_limit_wait_retry_at_epoch && Number(status.api_limit_wait_retry_at_epoch) > 0) {
+    return Math.max(0, Number(status.api_limit_wait_retry_at_epoch) - nowEpoch);
+  }
+  return 0;
+}
+
 export function App() {
   const [projectPath, setProjectPath] = useState(DEFAULT_PROJECT);
   const [args, setArgs] = useState('--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose');
@@ -289,6 +300,10 @@ export function App() {
     status?.status === 'paused' ||
     status?.last_action === 'api_limit' ||
     fiveHourStatus === 'limited';
+  const apiLimitCountdown = useMemo(
+    () => formatSecondsToHms(getApiLimitRemainingSeconds(status, nowEpoch)),
+    [status, nowEpoch]
+  );
   const snapshotAgeLabel = hasSnapshot ? formatAge(codexStatusSnapshot?.ageSeconds) : null;
   const liveSessionElapsed = useMemo(() => {
     if (isRateLimited) {
@@ -300,6 +315,9 @@ export function App() {
     return status?.session_elapsed_hms ?? '00:00:00';
   }, [status, nowEpoch, isRateLimited]);
   const liveLoopElapsed = useMemo(() => {
+    if (isRateLimited) {
+      return status?.loop_elapsed_hms ?? '00:00:00';
+    }
     if (
       status?.loop_started_epoch &&
       Number(status.loop_started_epoch) > 0 &&
@@ -308,7 +326,7 @@ export function App() {
       return formatSecondsToHms(nowEpoch - Number(status.loop_started_epoch));
     }
     return status?.loop_elapsed_hms ?? '00:00:00';
-  }, [status, nowEpoch]);
+  }, [status, nowEpoch, isRateLimited]);
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -367,7 +385,10 @@ export function App() {
             <CardDescription>Timer do Loop</CardDescription>
             <CardTitle className="text-2xl">{liveLoopElapsed}</CardTitle>
           </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">Status: {status?.last_action ?? 'idle'}</CardContent>
+          <CardContent className="text-xs text-muted-foreground">
+            Status: {status?.last_action ?? 'idle'}
+            {isRateLimited ? ` · retry in ${apiLimitCountdown}` : ''}
+          </CardContent>
         </Card>
 
         <Card>
