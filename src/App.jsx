@@ -239,6 +239,12 @@ export function App() {
     }
   }
 
+  async function refreshCodexQuota() {
+    setMessage('Atualizando cota Codex...');
+    await refreshProject();
+    setMessage('Cota Codex atualizada');
+  }
+
   useEffect(() => {
     refreshProcesses();
     refreshProject();
@@ -433,6 +439,9 @@ export function App() {
               </Button>
               <Button variant="secondary" onClick={saveCodexStatusSnapshot}>
                 <Terminal className="h-4 w-4" /> Salvar `/status`
+              </Button>
+              <Button variant="secondary" onClick={refreshCodexQuota}>
+                <RefreshCcw className="h-4 w-4" /> Atualizar Cota
               </Button>
               <Button variant="outline" onClick={clearCodexStatusSnapshot}>
                 <Square className="h-4 w-4" /> Limpar snapshot `/status`
