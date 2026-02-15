@@ -7,7 +7,8 @@ const {
   buildEffectiveQuota,
   formatResetLabelFromEpoch,
   deriveDiagnosticRootCause,
-  deriveDiagnosticRecommendation
+  deriveDiagnosticRecommendation,
+  listProviderCapabilities
 } = require('./index.js');
 
 test('parseLimitLine converts epoch reset labels to human-readable local label', () => {
@@ -100,4 +101,11 @@ test('deriveDiagnosticRecommendation handles stale runtime', () => {
     { fiveHour: { remainingPercent: 50 } }
   );
   assert.match(recommendation, /Recover Loop|reset-session/i);
+});
+
+test('listProviderCapabilities returns gemini as default provider', () => {
+  const capabilities = listProviderCapabilities();
+  assert.equal(capabilities.defaultProvider, 'gemini');
+  assert.equal(capabilities.providers.gemini.supportsDiagnosticsRefresh, false);
+  assert.equal(capabilities.providers.codex.supportsDiagnosticsRefresh, true);
 });

@@ -7,7 +7,9 @@ const { execSync, spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const DEFAULT_RALPH_SCRIPT = '/Users/matheuspuppe/Desktop/Projetos/github/ralph-codex/ralph_loop.sh';
+const WORKSPACE_ROOT = path.resolve(__dirname, '..', '..');
+const DEFAULT_RALPH_SCRIPT_CODEX = path.join(WORKSPACE_ROOT, 'ralph-codex', 'ralph_loop.sh');
+const DEFAULT_RALPH_SCRIPT_GEMINI = path.join(WORKSPACE_ROOT, 'packages', 'ralph-gemini', 'bin', 'ralph-gemini-loop.sh');
 const DEFAULT_RALPH_BIN = '/Users/matheuspuppe/.local/bin/ralph';
 const QUOTA_SNAPSHOT_STALE_SECONDS = 15 * 60;
 const RUNTIME_ORPHAN_THRESHOLD_SECONDS = 45;
@@ -15,6 +17,66 @@ const UI_CACHE_FILE = path.join(__dirname, '.cache', 'project-status-cache.json'
 
 app.use(cors());
 app.use(express.json());
+
+function resolveProvider(value) {
+  const provider = String(value || 'gemini').toLowerCase();
+  if (provider === 'codex') return 'codex';
+  return 'gemini';
+}
+
+function getProviderConfig(providerInput) {
+  const provider = resolveProvider(providerInput);
+  if (provider === 'codex') {
+    return {
+      provider,
+      displayName: 'Codex',
+      defaultScript: DEFAULT_RALPH_SCRIPT_CODEX,
+      defaultRunArgs: '--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose',
+      defaultRecoverArgs: '--sandbox workspace-write --full-auto --auto-reset-circuit --timeout 20 --calls 30 --verbose',
+      logFileBasename: 'ralph.log',
+      stderrPrefix: 'codex_stderr_',
+      statusSnapshotFile: 'codex_status_snapshot.txt',
+      sessionFile: '.codex_session_id'
+    };
+  }
+  return {
+    provider,
+    displayName: 'Gemini',
+    defaultScript: DEFAULT_RALPH_SCRIPT_GEMINI,
+    defaultRunArgs: '--max-loops 30 --sleep 2',
+    defaultRecoverArgs: '--max-loops 30 --sleep 2',
+    logFileBasename: 'ralph-gemini.log',
+    stderrPrefix: 'gemini_stderr_',
+    statusSnapshotFile: null,
+    sessionFile: '.gemini_session_id'
+  };
+}
+
+function listProviderCapabilities() {
+  const gemini = getProviderConfig('gemini');
+  const codex = getProviderConfig('codex');
+  return {
+    defaultProvider: 'gemini',
+    providers: {
+      gemini: {
+        id: gemini.provider,
+        displayName: gemini.displayName,
+        defaultArgs: gemini.defaultRunArgs,
+        supportsDiagnosticsRefresh: false,
+        supportsQuotaSnapshot: false,
+        logFileBasename: gemini.logFileBasename
+      },
+      codex: {
+        id: codex.provider,
+        displayName: codex.displayName,
+        defaultArgs: codex.defaultRunArgs,
+        supportsDiagnosticsRefresh: true,
+        supportsQuotaSnapshot: true,
+        logFileBasename: codex.logFileBasename
+      }
+    }
+  };
+}
 
 function safeReadJson(filePath) {
   try {
@@ -28,17 +90,21 @@ function readUiCache() {
   return safeReadJson(UI_CACHE_FILE) || {};
 }
 
-function getUiCacheRecord(projectPath) {
-  const cache = readUiCache();
-  return cache[String(projectPath)] || null;
+function getUiCacheKey(projectPath, providerInput) {
+  return `${resolveProvider(providerInput)}::${String(projectPath)}`;
 }
 
-function saveUiCacheRecord(projectPath, payload) {
+function getUiCacheRecord(projectPath, providerInput = 'gemini') {
+  const cache = readUiCache();
+  return cache[getUiCacheKey(projectPath, providerInput)] || null;
+}
+
+function saveUiCacheRecord(projectPath, payload, providerInput = 'gemini') {
   try {
     const cacheDir = path.dirname(UI_CACHE_FILE);
     fs.mkdirSync(cacheDir, { recursive: true });
     const cache = readUiCache();
-    cache[String(projectPath)] = {
+    cache[getUiCacheKey(projectPath, providerInput)] = {
       updatedAt: new Date().toISOString(),
       payload
     };
@@ -201,9 +267,14 @@ function parseProcessTable(output) {
     });
 }
 
-function listRuntimeProcesses() {
+function listRuntimeProcesses(providerInput = 'gemini') {
+  const provider = resolveProvider(providerInput);
+  const processPattern =
+    provider === 'codex'
+      ? "ralph_loop.sh|ralph --|codex exec"
+      : "ralph-gemini-loop.sh|gemini|ralph --";
   try {
-    const output = execSync("ps -axo pid,ppid,etime,command | grep -E 'ralph_loop.sh|ralph --|codex exec' | grep -v grep", {
+    const output = execSync(`ps -axo pid,ppid,etime,command | grep -E '${processPattern}' | grep -v grep`, {
       encoding: 'utf8'
     });
     return parseProcessTable(output);
@@ -220,15 +291,16 @@ function getStatusAgeSeconds(status) {
   return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
 }
 
-function deriveDiagnosticRootCause(status, runtime, codexQuotaEffective) {
+function deriveDiagnosticRootCause(status, runtime, codexQuotaEffective, providerInput = 'codex') {
+  const { displayName } = getProviderConfig(providerInput);
   const statusName = String(status?.status || '').toLowerCase();
   const lastAction = String(status?.last_action || '').toLowerCase();
   const exitReason = String(status?.exit_reason || '').toLowerCase();
   const fiveHourRemaining = codexQuotaEffective?.fiveHour?.remainingPercent;
 
-  if (exitReason === 'permission_denied') return 'Permission denied by Codex sandbox/approval policy';
-  if (exitReason === 'execution_timeout' || lastAction === 'timeout') return 'Codex execution timeout';
-  if (exitReason === 'api_5hour_limit' || lastAction === 'api_limit' || fiveHourRemaining === 0) return 'Codex 5-hour rate limit reached';
+  if (exitReason === 'permission_denied') return `Permission denied by ${displayName} sandbox/approval policy`;
+  if (exitReason === 'execution_timeout' || lastAction === 'timeout') return `${displayName} execution timeout`;
+  if (exitReason === 'api_5hour_limit' || lastAction === 'api_limit' || fiveHourRemaining === 0) return `${displayName} 5-hour rate limit reached`;
   if (exitReason === 'process_missing' || statusName === 'stopped_unexpected') return 'Ralph process ended unexpectedly (orphan runtime state)';
   if (runtime?.runtimeHealthy === false) return 'Runtime stale/offline with no active healthy process';
   if (statusName === 'error' || statusName === 'failed') return 'Loop execution failure reported by Ralph';
@@ -237,14 +309,15 @@ function deriveDiagnosticRootCause(status, runtime, codexQuotaEffective) {
   return 'Unknown state (insufficient diagnostics context)';
 }
 
-function deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective) {
+function deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective, providerInput = 'codex') {
+  const { displayName } = getProviderConfig(providerInput);
   const statusName = String(status?.status || '').toLowerCase();
   const lastAction = String(status?.last_action || '').toLowerCase();
   const exitReason = String(status?.exit_reason || '').toLowerCase();
   const fiveHourRemaining = codexQuotaEffective?.fiveHour?.remainingPercent;
 
   if (exitReason === 'permission_denied') {
-    return "Review Codex approval/sandbox settings, then run 'ralph --reset-session' and restart.";
+    return `Review ${displayName} approval/sandbox settings, then run 'ralph --reset-session' and restart.`;
   }
   if (exitReason === 'execution_timeout' || lastAction === 'timeout') {
     return 'Increase timeout and/or split the task into smaller steps.';
@@ -256,7 +329,7 @@ function deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective) {
     return "Use 'Recover Loop' or run 'ralph --reset-session' then start again with monitor enabled.";
   }
   if (statusName === 'error' || statusName === 'failed') {
-    return 'Inspect latest codex_output/codex_stderr logs and fix the first blocking error.';
+    return 'Inspect latest agent output/stderr logs and fix the first blocking error.';
   }
   if (statusName === 'running' || statusName === 'executing') {
     return 'No action required. Keep monitoring loop progress and quota.';
@@ -264,7 +337,7 @@ function deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective) {
   return 'Refresh diagnostics and verify status/log artifacts.';
 }
 
-function buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective }) {
+function buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective, provider = 'codex' }) {
   const ralphDir = path.join(projectPath, '.ralph');
   const diagnosticsJsonFile = path.join(ralphDir, 'diagnostics_latest.json');
   const diagnosticsMdFile = path.join(ralphDir, 'diagnostics_latest.md');
@@ -284,10 +357,10 @@ function buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffec
       rootCause:
         diagnosticsJson?.root_cause ||
         diagnosticsJson?.rootCause ||
-        deriveDiagnosticRootCause(status, runtime, codexQuotaEffective),
+        deriveDiagnosticRootCause(status, runtime, codexQuotaEffective, provider),
       recommendation:
         diagnosticsJson?.recommendation ||
-        deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective),
+        deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective, provider),
       raw: diagnosticsJson,
       markdownPreview: diagnosticsMarkdown ? diagnosticsMarkdown.split('\n').slice(0, 40).join('\n') : '',
       files: {
@@ -302,8 +375,8 @@ function buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffec
     generatedAt,
     generatedAgeSeconds,
     isStale,
-    rootCause: deriveDiagnosticRootCause(status, runtime, codexQuotaEffective),
-    recommendation: deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective),
+    rootCause: deriveDiagnosticRootCause(status, runtime, codexQuotaEffective, provider),
+    recommendation: deriveDiagnosticRecommendation(status, runtime, codexQuotaEffective, provider),
     raw: null,
     markdownPreview: diagnosticsMarkdown ? diagnosticsMarkdown.split('\n').slice(0, 40).join('\n') : '',
     files: {
@@ -499,10 +572,11 @@ function buildSnapshotTextFromRateLimits(rateLimits) {
   return `Rate limits remaining\n${fivePart}\n${weekPart}`;
 }
 
-function parseCodexQuota(projectPath) {
+function parseCodexQuota(projectPath, providerInput = 'codex') {
+  const { displayName, logFileBasename, stderrPrefix } = getProviderConfig(providerInput);
   const logDir = path.join(projectPath, '.ralph', 'logs');
-  const ralphLog = tailFile(path.join(logDir, 'ralph.log'), 2000);
-  const stderrFiles = listRecentLogFilesByPrefix(logDir, 'codex_stderr_', 8);
+  const ralphLog = tailFile(path.join(logDir, logFileBasename), 2000);
+  const stderrFiles = listRecentLogFilesByPrefix(logDir, stderrPrefix, 8);
   const stderrText = stderrFiles.map((filePath) => tailFile(filePath, 120)).join('\n');
   const corpus = `${ralphLog}\n${stderrText}`;
   const lines = corpus.split('\n').filter(Boolean);
@@ -541,12 +615,12 @@ function parseCodexQuota(projectPath) {
     fiveHour: {
       status: statusFromSignal(fiveHourLine),
       lastSignal: fiveHourLine || '',
-      source: fiveHourLine ? 'ralph/codex logs' : 'no recent limit signals'
+      source: fiveHourLine ? `ralph/${providerInput} logs` : 'no recent limit signals'
     },
     weekly: {
       status: statusFromSignal(weeklyLine),
       lastSignal: weeklyLine || '',
-      source: weeklyLine ? 'ralph/codex logs' : 'Codex CLI does not expose weekly usage directly in normal flow'
+      source: weeklyLine ? `ralph/${providerInput} logs` : `${displayName} CLI does not expose weekly usage directly in normal flow`
     },
     updatedAt: new Date().toISOString()
   };
@@ -635,8 +709,13 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/processes', (_req, res) => {
-  res.json({ processes: listRuntimeProcesses() });
+app.get('/api/providers', (_req, res) => {
+  res.json(listProviderCapabilities());
+});
+
+app.get('/api/processes', (req, res) => {
+  const provider = resolveProvider(req.query.provider);
+  res.json({ provider, processes: listRuntimeProcesses(provider) });
 });
 
 function launchRalph({ projectPath, args, ralphScript }) {
@@ -674,11 +753,51 @@ function refreshRalphDiagnostics({ projectPath }) {
   }
 }
 
+function resolvePrimaryLogFile(projectPath, providerConfig) {
+  const logDir = path.join(projectPath, '.ralph', 'logs');
+  const preferred = path.join(logDir, providerConfig.logFileBasename);
+  if (fs.existsSync(preferred)) return preferred;
+  const fallbackNames = ['ralph-gemini.log', 'ralph.log'];
+  for (const name of fallbackNames) {
+    const candidate = path.join(logDir, name);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return preferred;
+}
+
+function resetCircuitState({ projectPath, providerInput }) {
+  const provider = resolveProvider(providerInput);
+  if (provider === 'codex') {
+    try {
+      execSync('~/.local/bin/ralph --reset-circuit', {
+        cwd: projectPath,
+        stdio: 'ignore',
+        shell: '/bin/bash'
+      });
+    } catch {
+      // best-effort reset
+    }
+    return;
+  }
+
+  const ralphDir = path.join(projectPath, '.ralph');
+  const targets = ['.circuit_breaker_state', '.circuit_breaker_history'];
+  targets.forEach((fileName) => {
+    try {
+      fs.rmSync(path.join(ralphDir, fileName), { force: true });
+    } catch {
+      // best-effort cleanup
+    }
+  });
+}
+
 app.post('/api/run', (req, res) => {
+  const provider = resolveProvider(req.body?.provider);
+  const providerConfig = getProviderConfig(provider);
   const {
     projectPath,
-    args = '--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose',
-    ralphScript = DEFAULT_RALPH_SCRIPT
+    args = providerConfig.defaultRunArgs,
+    ralphScript = providerConfig.defaultScript
   } = req.body || {};
 
   if (!projectPath || !fs.existsSync(projectPath)) {
@@ -686,38 +805,36 @@ app.post('/api/run', (req, res) => {
   }
 
   const launched = launchRalph({ projectPath, args, ralphScript });
-  return res.json({ started: true, ...launched });
+  return res.json({ started: true, provider, ...launched });
 });
 
 app.post('/api/recover', (req, res) => {
+  const provider = resolveProvider(req.body?.provider);
+  const providerConfig = getProviderConfig(provider);
   const {
     projectPath,
-    args = '--sandbox workspace-write --full-auto --auto-reset-circuit --timeout 20 --calls 30 --verbose',
-    ralphScript = DEFAULT_RALPH_SCRIPT
+    args = providerConfig.defaultRecoverArgs,
+    ralphScript = providerConfig.defaultScript
   } = req.body || {};
 
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
   }
 
-  try {
-    execSync('~/.local/bin/ralph --reset-circuit', {
-      cwd: projectPath,
-      stdio: 'ignore',
-      shell: '/bin/bash'
-    });
-  } catch {
-    // best-effort reset
-  }
+  resetCircuitState({ projectPath, providerInput: provider });
 
   const launched = launchRalph({ projectPath, args, ralphScript });
-  return res.json({ recovered: true, ...launched });
+  return res.json({ recovered: true, provider, ...launched });
 });
 
 app.post('/api/refresh-diagnostics', (req, res) => {
   const projectPath = req.body?.projectPath;
+  const provider = resolveProvider(req.body?.provider);
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
+  }
+  if (provider === 'gemini') {
+    return res.json({ refreshed: true, provider, command: 'diagnostics-skip-for-gemini', skipped: true });
   }
 
   const refreshed = refreshRalphDiagnostics({ projectPath });
@@ -742,25 +859,29 @@ app.post('/api/stop', (req, res) => {
 });
 
 app.get('/api/project-status', (req, res) => {
+  const provider = resolveProvider(req.query.provider);
+  const providerConfig = getProviderConfig(provider);
   const projectPath = req.query.projectPath;
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
   }
 
   const statusFile = path.join(projectPath, '.ralph', 'status.json');
-  const logFile = path.join(projectPath, '.ralph', 'logs', 'ralph.log');
+  const logFile = resolvePrimaryLogFile(projectPath, providerConfig);
   const fixPlanFile = path.join(projectPath, '.ralph', 'fix_plan.md');
-  const codexStatusSnapshotFile = path.join(projectPath, '.ralph', 'codex_status_snapshot.txt');
+  const codexStatusSnapshotFile = providerConfig.statusSnapshotFile
+    ? path.join(projectPath, '.ralph', providerConfig.statusSnapshotFile)
+    : null;
 
   let status = safeReadJson(statusFile);
   const fixPlan = fs.existsSync(fixPlanFile) ? fs.readFileSync(fixPlanFile, 'utf8') : '';
   const logs = tailFile(logFile, 100);
-  const codexQuota = parseCodexQuota(projectPath);
-  const processes = listRuntimeProcesses();
-  const codexStatusSnapshotRaw = safeReadText(codexStatusSnapshotFile);
+  const codexQuota = parseCodexQuota(projectPath, provider);
+  const processes = listRuntimeProcesses(provider);
+  const codexStatusSnapshotRaw = codexStatusSnapshotFile ? safeReadText(codexStatusSnapshotFile) : '';
   let codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
-  const snapshotCapturedAt = getFileMtimeIso(codexStatusSnapshotFile);
-  const sessionRateLimits = readLatestRateLimitsFromCodexSessions();
+  const snapshotCapturedAt = codexStatusSnapshotFile ? getFileMtimeIso(codexStatusSnapshotFile) : null;
+  const sessionRateLimits = provider === 'codex' ? readLatestRateLimitsFromCodexSessions() : null;
   const statusAgeSeconds = getStatusAgeSeconds(status);
 
   if (codexStatusSnapshot && snapshotCapturedAt) {
@@ -770,7 +891,8 @@ app.get('/api/project-status', (req, res) => {
     codexStatusSnapshot.isStale = ageSeconds > QUOTA_SNAPSHOT_STALE_SECONDS;
   }
 
-  const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, status?.codex_quota_effective);
+  const statusEffectiveQuota = status?.agent_quota_effective || status?.codex_quota_effective;
+  const codexQuotaEffective = buildEffectiveQuota(codexStatusSnapshot, codexQuota, sessionRateLimits, statusEffectiveQuota);
   const activeStatuses = ['running', 'paused', 'retrying', 'executing'];
   const statusName = String(status?.status || '').toLowerCase();
   const appearsOrphaned =
@@ -803,13 +925,20 @@ app.get('/api/project-status', (req, res) => {
       isFresh &&
       !isTerminalStatus
   };
-  const diagnostics = buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective });
-  const cached = getUiCacheRecord(projectPath);
+  const diagnostics = buildDiagnosticsPayload({ projectPath, status, runtime, codexQuotaEffective, provider });
+  const cached = getUiCacheRecord(projectPath, provider);
   const cachedPayload = cached?.payload || null;
   const payload = {
+    provider,
     status: status || cachedPayload?.status || null,
     logs: logs || cachedPayload?.logs || '',
     fixPlan: fixPlan || cachedPayload?.fixPlan || '',
+    agentQuota: codexQuota || cachedPayload?.agentQuota || null,
+    agentStatusSnapshot: codexStatusSnapshot || cachedPayload?.agentStatusSnapshot || null,
+    agentQuotaEffective:
+      (codexQuotaEffective?.source !== 'none' ? codexQuotaEffective : null) ||
+      cachedPayload?.agentQuotaEffective ||
+      codexQuotaEffective,
     codexQuota: codexQuota || cachedPayload?.codexQuota || null,
     codexStatusSnapshot: codexStatusSnapshot || cachedPayload?.codexStatusSnapshot || null,
     codexQuotaEffective:
@@ -827,11 +956,13 @@ app.get('/api/project-status', (req, res) => {
     payload.cacheUsed = true;
   }
 
-  saveUiCacheRecord(projectPath, payload);
+  saveUiCacheRecord(projectPath, payload, provider);
   res.json(payload);
 });
 
 app.get('/api/export-diagnostics', (req, res) => {
+  const provider = resolveProvider(req.query.provider);
+  const providerConfig = getProviderConfig(provider);
   const projectPath = req.query.projectPath;
   if (!projectPath || !fs.existsSync(projectPath)) {
     return res.status(400).json({ error: 'projectPath invalido' });
@@ -841,7 +972,7 @@ app.get('/api/export-diagnostics', (req, res) => {
   const logDir = path.join(ralphDir, 'logs');
   const statusFile = path.join(ralphDir, 'status.json');
   const fixPlanFile = path.join(ralphDir, 'fix_plan.md');
-  const sessionFile = path.join(ralphDir, '.codex_session_id');
+  const sessionFile = path.join(ralphDir, providerConfig.sessionFile);
   const responseAnalysisFile = path.join(ralphDir, '.response_analysis');
   const recentLogFiles = listRecentLogFiles(logDir, 10);
 
@@ -856,24 +987,27 @@ app.get('/api/export-diagnostics', (req, res) => {
     fixPlan: safeReadText(fixPlanFile),
     sessionId: safeReadText(sessionFile).trim(),
     responseAnalysis: safeReadText(responseAnalysisFile),
-    codexQuota: parseCodexQuota(projectPath),
-    codexStatusSnapshot: parseCodexStatusSnapshotText(safeReadText(path.join(ralphDir, 'codex_status_snapshot.txt'))),
+    provider,
+    codexQuota: parseCodexQuota(projectPath, provider),
+    codexStatusSnapshot: providerConfig.statusSnapshotFile
+      ? parseCodexStatusSnapshotText(safeReadText(path.join(ralphDir, providerConfig.statusSnapshotFile)))
+      : null,
     codexQuotaEffective: null,
     diagnosticsLatestJson: safeReadJson(path.join(ralphDir, 'diagnostics_latest.json')),
     diagnosticsLatestMarkdown: safeReadText(path.join(ralphDir, 'diagnostics_latest.md')),
     processes: [],
     logs: {
-      ralphTail100: tailFile(path.join(logDir, 'ralph.log'), 100),
+      ralphTail100: tailFile(path.join(logDir, providerConfig.logFileBasename), 100),
       recentFiles: {}
     }
   };
 
-  diagnostics.processes = listRuntimeProcesses();
+  diagnostics.processes = listRuntimeProcesses(provider);
   diagnostics.codexQuotaEffective = buildEffectiveQuota(
     diagnostics.codexStatusSnapshot,
     diagnostics.codexQuota,
-    readLatestRateLimitsFromCodexSessions(),
-    diagnostics.status?.codex_quota_effective
+    provider === 'codex' ? readLatestRateLimitsFromCodexSessions() : null,
+    diagnostics.status?.agent_quota_effective || diagnostics.status?.codex_quota_effective
   );
 
   recentLogFiles.forEach((filePath) => {
@@ -900,5 +1034,6 @@ module.exports = {
   buildEffectiveQuota,
   formatResetLabelFromEpoch,
   deriveDiagnosticRootCause,
-  deriveDiagnosticRecommendation
+  deriveDiagnosticRecommendation,
+  listProviderCapabilities
 };

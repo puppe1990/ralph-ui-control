@@ -33,7 +33,12 @@ import {
   TableRow
 } from './components/ui/table';
 
-const DEFAULT_PROJECT = '/Users/matheuspuppe/Desktop/Projetos/github/browser-sql-ide';
+const DEFAULT_PROJECT = '/Users/matheuspuppe/Desktop/Projetos/Ralph Empire';
+const DEFAULT_ARGS_BY_PROVIDER = {
+  gemini: '--max-loops 30 --sleep 2',
+  codex: '--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose'
+};
+const PROVIDER_STORAGE_KEY = 'ralph-control-ui.provider';
 
 function statusVariant(status) {
   if (status === 'running' || status === 'executing') return 'success';
@@ -139,31 +144,38 @@ function getLogEventKind(line) {
   if (
     text.includes('session reset') ||
     text.includes('starting new codex session') ||
+    text.includes('starting new gemini session') ||
     text.includes('resuming codex thread') ||
+    text.includes('resuming gemini') ||
     text.includes('resume strategy')
   ) return 'session';
   if (
     text.includes('=== starting loop') ||
     text.includes('=== completed loop') ||
     text.includes('executing codex cli') ||
+    text.includes('calling gemini') ||
     text.includes('starting main loop') ||
     text.includes('loop #')
   ) return 'loop';
   if (
     text.includes('codex progress:') ||
-    text.includes('codex working')
+    text.includes('codex working') ||
+    text.includes('gemini working')
   ) return 'progress';
   if (
     text.includes('quota snapshot') ||
-    text.includes('codex quota')
+    text.includes('codex quota') ||
+    text.includes('gemini quota')
   ) return 'quota';
   if (
     text.includes('analyzing codex response') ||
+    text.includes('analyzing gemini response') ||
     text.includes('real code progress')
   ) return 'analysis';
   if (
     text.includes('execution completed successfully') ||
     text.includes('saved codex thread') ||
+    text.includes('completion signal detected') ||
     text.includes('✅')
   ) return 'success';
   return 'default';
@@ -194,12 +206,21 @@ function getLogEventClass(kind) {
 
 export function App() {
   const [projectPath, setProjectPath] = useState(DEFAULT_PROJECT);
-  const [args, setArgs] = useState('--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose');
+  const [providerCapabilities, setProviderCapabilities] = useState(null);
+  const [provider, setProvider] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem(PROVIDER_STORAGE_KEY);
+      return saved || 'gemini';
+    } catch {
+      return 'gemini';
+    }
+  });
+  const [args, setArgs] = useState(DEFAULT_ARGS_BY_PROVIDER.gemini);
   const [processes, setProcesses] = useState([]);
   const [status, setStatus] = useState(null);
-  const [codexQuota, setCodexQuota] = useState(null);
-  const [codexStatusSnapshot, setCodexStatusSnapshot] = useState(null);
-  const [codexQuotaEffective, setCodexQuotaEffective] = useState(null);
+  const [agentQuota, setAgentQuota] = useState(null);
+  const [agentStatusSnapshot, setAgentStatusSnapshot] = useState(null);
+  const [agentQuotaEffective, setAgentQuotaEffective] = useState(null);
   const [diagnostics, setDiagnostics] = useState(null);
   const [runtime, setRuntime] = useState(null);
   const [logs, setLogs] = useState('');
@@ -209,8 +230,10 @@ export function App() {
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
   const [logsFullscreen, setLogsFullscreen] = useState(false);
   const [toast, setToast] = useState(null);
+  const [completionModal, setCompletionModal] = useState({ open: false, title: '', detail: '' });
   const logsRef = useRef(null);
   const toastTimeoutRef = useRef(null);
+  const previousStatusRef = useRef(null);
 
   function showToast({ title, description, variant = 'success', durationMs = 2200 }) {
     if (toastTimeoutRef.current) {
@@ -223,9 +246,25 @@ export function App() {
     }, durationMs);
   }
 
+  async function refreshProviders() {
+    try {
+      const res = await fetch('/api/providers');
+      const data = await res.json();
+      if (!res.ok) return;
+      setProviderCapabilities(data || null);
+      const available = data?.providers ? Object.keys(data.providers) : [];
+      if (available.length > 0 && !available.includes(provider)) {
+        const fallback = data.defaultProvider || available[0];
+        setProvider(fallback);
+      }
+    } catch {
+      // best effort
+    }
+  }
+
   async function refreshProcesses() {
     try {
-      const res = await fetch('/api/processes');
+      const res = await fetch(`/api/processes?provider=${encodeURIComponent(provider)}`);
       const data = await res.json();
       setProcesses(data.processes || []);
     } catch {
@@ -235,16 +274,18 @@ export function App() {
 
   async function refreshProject() {
     try {
-      const res = await fetch(`/api/project-status?projectPath=${encodeURIComponent(projectPath)}`);
+      const res = await fetch(
+        `/api/project-status?projectPath=${encodeURIComponent(projectPath)}&provider=${encodeURIComponent(provider)}`
+      );
       const data = await res.json();
       if (!res.ok) {
         setMessage(data.error || 'Erro ao carregar projeto');
         return;
       }
       setStatus(data.status || null);
-      setCodexQuota(data.codexQuota || null);
-      setCodexStatusSnapshot(data.codexStatusSnapshot || null);
-      setCodexQuotaEffective(data.codexQuotaEffective || null);
+      setAgentQuota(data.agentQuota || data.codexQuota || null);
+      setAgentStatusSnapshot(data.agentStatusSnapshot || data.codexStatusSnapshot || null);
+      setAgentQuotaEffective(data.agentQuotaEffective || data.codexQuotaEffective || null);
       setDiagnostics(data.diagnostics || null);
       setRuntime(data.runtime || null);
       if (Array.isArray(data.processes)) {
@@ -258,12 +299,12 @@ export function App() {
   }
 
   async function startRalph() {
-    setMessage('Iniciando Ralph...');
+    setMessage(`Iniciando Ralph (${provider})...`);
     try {
       const res = await fetch('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, args })
+        body: JSON.stringify({ projectPath, args, provider })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -284,7 +325,7 @@ export function App() {
       const res = await fetch('/api/recover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath, args })
+        body: JSON.stringify({ projectPath, args, provider })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -322,7 +363,9 @@ export function App() {
   async function exportDiagnostics() {
     try {
       setMessage('Gerando pacote de diagnostico...');
-      const res = await fetch(`/api/export-diagnostics?projectPath=${encodeURIComponent(projectPath)}`);
+      const res = await fetch(
+        `/api/export-diagnostics?projectPath=${encodeURIComponent(projectPath)}&provider=${encodeURIComponent(provider)}`
+      );
       if (!res.ok) {
         let detail = '';
         const contentType = res.headers.get('content-type') || '';
@@ -358,9 +401,15 @@ export function App() {
   }
 
   async function refreshCodexQuota() {
-    setMessage('Atualizando cota Codex...');
+    const supportsQuotaSnapshot = providerCapabilities?.providers?.[provider]?.supportsQuotaSnapshot !== false;
+    if (!supportsQuotaSnapshot) {
+      setMessage(`Quota snapshot não disponível para ${provider}. Exibindo status/heurísticas locais.`);
+      await refreshProject();
+      return;
+    }
+    setMessage(`Atualizando cota ${provider}...`);
     await refreshProject();
-    setMessage('Cota Codex atualizada');
+    setMessage(`Cota ${provider} atualizada`);
   }
 
   async function refreshDiagnostics() {
@@ -369,11 +418,16 @@ export function App() {
       const res = await fetch('/api/refresh-diagnostics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath })
+        body: JSON.stringify({ projectPath, provider })
       });
       const data = await res.json();
       if (!res.ok) {
         setMessage(`Erro ao atualizar diagnostico: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+      if (data.skipped) {
+        setMessage(`Diagnóstico sob demanda não suportado para ${provider}.`);
+        await refreshProject();
         return;
       }
       await refreshProject();
@@ -404,6 +458,7 @@ export function App() {
   }
 
   useEffect(() => {
+    refreshProviders();
     refreshProcesses();
     refreshProject();
     const id = setInterval(() => {
@@ -411,7 +466,23 @@ export function App() {
       refreshProject();
     }, 4000);
     return () => clearInterval(id);
-  }, []);
+  }, [projectPath, provider]);
+
+  useEffect(() => {
+    const providerDefault =
+      providerCapabilities?.providers?.[provider]?.defaultArgs ||
+      DEFAULT_ARGS_BY_PROVIDER[provider] ||
+      DEFAULT_ARGS_BY_PROVIDER.gemini;
+    setArgs(providerDefault);
+  }, [provider, providerCapabilities]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PROVIDER_STORAGE_KEY, provider);
+    } catch {
+      // ignore storage failures
+    }
+  }, [provider]);
 
   useEffect(() => {
     const tickId = setInterval(() => {
@@ -424,6 +495,25 @@ export function App() {
     if (!logsAutoScroll || !logsRef.current) return;
     logsRef.current.scrollTop = logsRef.current.scrollHeight;
   }, [logs, logsAutoScroll]);
+
+  useEffect(() => {
+    const prevStatus = String(previousStatusRef.current?.status || '').toLowerCase();
+    const currStatus = String(status?.status || '').toLowerCase();
+    const terminalStatuses = ['completed', 'stopped', 'halted', 'error', 'failed', 'stopped_unexpected'];
+    const wasActive = ['running', 'retrying', 'paused'].includes(prevStatus);
+    const nowTerminal = terminalStatuses.includes(currStatus);
+
+    if (status && wasActive && nowTerminal) {
+      const exitReason = status?.exit_reason || 'unknown';
+      const title = currStatus === 'completed' || exitReason === 'completion_signals' || exitReason === 'project_complete'
+        ? 'Ralph finished the run'
+        : 'Ralph run ended';
+      const detail = `Status: ${currStatus || 'unknown'} | Last action: ${status?.last_action || 'n/a'} | Exit reason: ${exitReason}`;
+      setCompletionModal({ open: true, title, detail });
+    }
+
+    previousStatusRef.current = status;
+  }, [status]);
 
   useEffect(() => {
     return () => {
@@ -457,9 +547,9 @@ export function App() {
     }
     return status.status;
   }, [status, runtime]);
-  const fiveHourQuota = codexQuotaEffective?.fiveHour || codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
-  const weeklyQuota = codexQuotaEffective?.weekly || codexStatusSnapshot?.weekly || codexQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
-  const hasSnapshot = Boolean(codexStatusSnapshot?.capturedAt);
+  const fiveHourQuota = agentQuotaEffective?.fiveHour || agentStatusSnapshot?.fiveHour || agentQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
+  const weeklyQuota = agentQuotaEffective?.weekly || agentStatusSnapshot?.weekly || agentQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
+  const hasSnapshot = Boolean(agentStatusSnapshot?.capturedAt);
   const fiveHourRemaining = getRemainingPercent(fiveHourQuota);
   const weeklyRemaining = getRemainingPercent(weeklyQuota);
   const fiveHourStatus = getQuotaStatus(fiveHourQuota);
@@ -472,18 +562,23 @@ export function App() {
     () => formatSecondsToHms(getApiLimitRemainingSeconds(status, nowEpoch)),
     [status, nowEpoch]
   );
-  const snapshotAgeLabel = hasSnapshot ? formatAge(codexStatusSnapshot?.ageSeconds) : null;
+  const snapshotAgeLabel = hasSnapshot ? formatAge(agentStatusSnapshot?.ageSeconds) : null;
+  const isRuntimeActive = useMemo(() => {
+    const state = String(status?.status || '').toLowerCase();
+    const action = String(status?.last_action || '').toLowerCase();
+    return state === 'running' || state === 'retrying' || action === 'executing';
+  }, [status]);
   const liveSessionElapsed = useMemo(() => {
-    if (isRateLimited) {
+    if (isRateLimited || !isRuntimeActive) {
       return status?.session_elapsed_hms ?? '00:00:00';
     }
     if (status?.session_started_epoch && Number(status.session_started_epoch) > 0) {
       return formatSecondsToHms(nowEpoch - Number(status.session_started_epoch));
     }
     return status?.session_elapsed_hms ?? '00:00:00';
-  }, [status, nowEpoch, isRateLimited]);
+  }, [status, nowEpoch, isRateLimited, isRuntimeActive]);
   const liveLoopElapsed = useMemo(() => {
-    if (isRateLimited) {
+    if (isRateLimited || !isRuntimeActive) {
       return status?.loop_elapsed_hms ?? '00:00:00';
     }
     if (
@@ -494,12 +589,13 @@ export function App() {
       return formatSecondsToHms(nowEpoch - Number(status.loop_started_epoch));
     }
     return status?.loop_elapsed_hms ?? '00:00:00';
-  }, [status, nowEpoch, isRateLimited]);
+  }, [status, nowEpoch, isRateLimited, isRuntimeActive]);
   const diagnosticsAgeLabel = diagnostics?.generatedAgeSeconds != null ? formatAge(diagnostics.generatedAgeSeconds) : '--';
   const diagnosticsBadgeVariant = diagnostics?.isStale ? 'warning' : 'outline';
   const diagnosticsRootCause = diagnostics?.rootCause || 'Sem diagnostico consolidado';
   const diagnosticsRecommendation = diagnostics?.recommendation || 'Atualize o diagnostico para obter recomendacoes.';
   const diagnosticsSource = diagnostics?.source || 'derived';
+  const supportsDiagnosticsRefresh = providerCapabilities?.providers?.[provider]?.supportsDiagnosticsRefresh !== false;
   const logLines = useMemo(() => String(logs || '').split('\n'), [logs]);
 
   return (
@@ -509,7 +605,7 @@ export function App() {
           <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
             <div className="space-y-3">
               <div className="inline-flex items-center gap-2 rounded-full border border-border/70 bg-card/80 px-3 py-1 text-xs text-muted-foreground">
-                <Terminal className="h-3.5 w-3.5" /> Ralph + Codex Control Center
+                <Terminal className="h-3.5 w-3.5" /> Ralph + {provider.toUpperCase()} Control Center
               </div>
               <h1 className="text-3xl font-semibold tracking-tight md:text-4xl">Ralph Control UI</h1>
               <p className="max-w-2xl text-sm text-muted-foreground md:text-base">
@@ -523,15 +619,15 @@ export function App() {
               </Badge>
               <Badge variant={quotaVariant(fiveHourStatus)} className="px-3 py-1 text-xs">
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
-                CODEX 5H: {fiveHourRemaining != null ? `${fiveHourRemaining}% REMAINING` : 'NO SNAPSHOT'}
+                {provider.toUpperCase()} 5H: {fiveHourRemaining != null ? `${fiveHourRemaining}% REMAINING` : 'NO SNAPSHOT'}
               </Badge>
               <Badge variant={quotaVariant(weeklyStatus)} className="px-3 py-1 text-xs">
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
-                CODEX WEEKLY: {weeklyRemaining != null ? `${weeklyRemaining}% REMAINING` : 'NO SNAPSHOT'}
+                {provider.toUpperCase()} WEEKLY: {weeklyRemaining != null ? `${weeklyRemaining}% REMAINING` : 'NO SNAPSHOT'}
               </Badge>
               {hasSnapshot && (
-                <Badge variant={codexStatusSnapshot?.isStale ? 'warning' : 'outline'} className="px-3 py-1 text-xs">
-                  Snapshot /status: {codexStatusSnapshot?.isStale ? 'STALE' : 'FRESH'} ({snapshotAgeLabel} ago)
+                <Badge variant={agentStatusSnapshot?.isStale ? 'warning' : 'outline'} className="px-3 py-1 text-xs">
+                  Snapshot /status: {agentStatusSnapshot?.isStale ? 'STALE' : 'FRESH'} ({snapshotAgeLabel} ago)
                 </Badge>
               )}
               {runtime && (
@@ -575,7 +671,7 @@ export function App() {
             <CardDescription>Processos Ativos</CardDescription>
             <CardTitle className="text-2xl">{processCount}</CardTitle>
           </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">Ralph/Codex detectados no host local</CardContent>
+          <CardContent className="text-xs text-muted-foreground">Processos Ralph/{provider.toUpperCase()} detectados no host local</CardContent>
         </Card>
 
         <Card>
@@ -588,27 +684,27 @@ export function App() {
 
         <Card>
           <CardHeader className="pb-2">
-            <CardDescription>Cota Codex (5h)</CardDescription>
+            <CardDescription>Cota {provider.toUpperCase()} (5h)</CardDescription>
             <CardTitle className="text-2xl">
               {fiveHourRemaining != null ? `${fiveHourRemaining}% remaining` : '--'}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-1 text-xs text-muted-foreground">
             <div>Reset: {fiveHourQuota.resetLabel || '--'}</div>
-            <div>Source: {codexQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
+            <div>Source: {agentQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader className="pb-2">
-            <CardDescription>Cota Codex (Semanal)</CardDescription>
+            <CardDescription>Cota {provider.toUpperCase()} (Semanal)</CardDescription>
             <CardTitle className="text-2xl">
               {weeklyRemaining != null ? `${weeklyRemaining}% remaining` : '--'}
             </CardTitle>
           </CardHeader>
           <CardContent className="space-y-1 text-xs text-muted-foreground">
             <div>Reset: {weeklyQuota.resetLabel || '--'}</div>
-            <div>Source: {codexQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
+            <div>Source: {agentQuotaEffective?.source || (hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics')}</div>
           </CardContent>
         </Card>
       </section>
@@ -628,7 +724,29 @@ export function App() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Args do Ralph</label>
+              <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Provider</label>
+              <select
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                value={provider}
+                onChange={(e) => setProvider(e.target.value)}
+              >
+                {providerCapabilities?.providers
+                  ? Object.entries(providerCapabilities.providers).map(([id, info]) => (
+                      <option key={id} value={id}>
+                        {info?.displayName || id}
+                      </option>
+                    ))
+                  : (
+                    <>
+                      <option value="gemini">Gemini</option>
+                      <option value="codex">Codex</option>
+                    </>
+                  )}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Args do Ralph ({provider})</label>
               <Textarea
                 className="min-h-[72px] font-mono"
                 value={args}
@@ -644,9 +762,9 @@ export function App() {
                 <RefreshCcw className="h-4 w-4" /> Recover Loop
               </Button>
               <Button variant="secondary" onClick={refreshCodexQuota}>
-                <RefreshCcw className="h-4 w-4" /> Atualizar Cota
+                <RefreshCcw className="h-4 w-4" /> Atualizar Cota ({provider})
               </Button>
-              <Button variant="secondary" onClick={refreshDiagnostics}>
+              <Button variant="secondary" onClick={refreshDiagnostics} disabled={!supportsDiagnosticsRefresh}>
                 <AlertTriangle className="h-4 w-4" /> Atualizar Diagnostico
               </Button>
               <Button variant="outline" onClick={exportDiagnostics}>
@@ -711,7 +829,7 @@ export function App() {
       <section className="mb-6">
         <Card>
           <CardHeader>
-            <CardTitle className="text-lg">Processos Ralph/Codex</CardTitle>
+            <CardTitle className="text-lg">Processos Ralph/{provider.toUpperCase()}</CardTitle>
             <CardDescription>Finalize processos diretamente pelo painel.</CardDescription>
           </CardHeader>
           <CardContent>
@@ -729,7 +847,7 @@ export function App() {
                 {processes.length === 0 ? (
                   <TableRow>
                     <TableCell colSpan={5} className="text-center text-sm text-muted-foreground">
-                      Nenhum processo Ralph/Codex em execução.
+                      Nenhum processo Ralph/{provider.toUpperCase()} em execução.
                     </TableCell>
                   </TableRow>
                 ) : (
@@ -759,7 +877,7 @@ export function App() {
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
-              <CardTitle className="text-lg">Logs (`ralph.log`)</CardTitle>
+              <CardTitle className="text-lg">{`Logs (\`${provider === 'gemini' ? 'ralph-gemini.log' : 'ralph.log'}\`)`}</CardTitle>
               <div className="flex items-center gap-2">
                 <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
                   Copiar logs
@@ -821,7 +939,7 @@ export function App() {
             <CardHeader>
               <div className="flex flex-col gap-3">
                 <div className="flex items-center justify-between gap-3">
-                  <CardTitle className="text-lg">Logs (`ralph.log`) - Fullscreen</CardTitle>
+                  <CardTitle className="text-lg">{`Logs (\`${provider === 'gemini' ? 'ralph-gemini.log' : 'ralph.log'}\`) - Fullscreen`}</CardTitle>
                   <div className="flex items-center gap-2">
                     <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
                       Copiar logs
@@ -852,13 +970,13 @@ export function App() {
                     <div className="mt-1 text-sm font-semibold text-slate-100">{liveSessionElapsed}</div>
                   </div>
                   <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
-                    <div className="text-muted-foreground">Cota Codex (5h)</div>
+                    <div className="text-muted-foreground">Cota {provider.toUpperCase()} (5h)</div>
                     <div className="mt-1 text-sm font-semibold text-slate-100">
                       {fiveHourRemaining != null ? `${fiveHourRemaining}% remaining` : '--'}
                     </div>
                   </div>
                   <div className="rounded-md border border-border/70 bg-card/60 px-3 py-2">
-                    <div className="text-muted-foreground">Cota Codex (Semanal)</div>
+                    <div className="text-muted-foreground">Cota {provider.toUpperCase()} (Semanal)</div>
                     <div className="mt-1 text-sm font-semibold text-slate-100">
                       {weeklyRemaining != null ? `${weeklyRemaining}% remaining` : '--'}
                     </div>
@@ -895,6 +1013,25 @@ export function App() {
             {toast.title}
           </div>
           <div className="mt-1 text-xs text-muted-foreground">{toast.description}</div>
+        </div>
+      )}
+
+      {completionModal.open && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-background/80 p-4">
+          <Card className="w-full max-w-xl border-border/70">
+            <CardHeader>
+              <CardTitle className="text-lg">{completionModal.title}</CardTitle>
+              <CardDescription>{completionModal.detail}</CardDescription>
+            </CardHeader>
+            <CardContent className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setCompletionModal({ open: false, title: '', detail: '' })}>
+                Fechar
+              </Button>
+              <Button onClick={() => { setCompletionModal({ open: false, title: '', detail: '' }); refreshProject(); }}>
+                Atualizar Status
+              </Button>
+            </CardContent>
+          </Card>
         </div>
       )}
     </main>
