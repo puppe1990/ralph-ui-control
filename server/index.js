@@ -63,6 +63,72 @@ function listRecentLogFilesByPrefix(logDir, prefix, limit = 8) {
   }
 }
 
+function stripAnsi(text) {
+  return String(text || '').replace(/\u001b\[[0-9;]*m/g, '');
+}
+
+function normalizeStatusLine(line) {
+  return stripAnsi(line)
+    .replace(/[│╭╮╰╯]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseLimitLine(line) {
+  const normalized = normalizeStatusLine(line);
+  if (!normalized) return null;
+
+  const leftMatch = normalized.match(/(\d{1,3})\s*%\s*left/i);
+  const usedMatch = normalized.match(/(\d{1,3})\s*%\s*used/i);
+  const genericPercentMatch = normalized.match(/(\d{1,3})\s*%/i);
+  const resetParenMatch = normalized.match(/\(resets?\s+([^)]+)\)/i);
+  const compactResetMatch = normalized.match(/(\d{1,3})\s*%\s*(.+)$/i);
+
+  let remainingPercent = null;
+  let usagePercent = null;
+  let resetLabel = null;
+
+  if (leftMatch) {
+    remainingPercent = Math.max(0, Math.min(100, Number(leftMatch[1])));
+    usagePercent = 100 - remainingPercent;
+  } else if (usedMatch) {
+    usagePercent = Math.max(0, Math.min(100, Number(usedMatch[1])));
+    remainingPercent = 100 - usagePercent;
+  } else if (genericPercentMatch) {
+    // "/status" popup shows "Rate limits remaining", so plain "%" is treated as remaining.
+    remainingPercent = Math.max(0, Math.min(100, Number(genericPercentMatch[1])));
+    usagePercent = 100 - remainingPercent;
+  }
+
+  if (resetParenMatch) {
+    resetLabel = resetParenMatch[1].trim();
+  } else if (compactResetMatch) {
+    const trailing = String(compactResetMatch[2] || '').trim();
+    if (trailing && !/left|used/i.test(trailing)) {
+      resetLabel = trailing;
+    }
+  }
+
+  const isLimitedByText = /(limit reached|rate limit reached|exceeded|blocked|no .*left|\b0\s*%\s*left\b)/i.test(normalized);
+  const isLimited = isLimitedByText || remainingPercent === 0;
+
+  return {
+    status: isLimited ? 'limited' : 'ok',
+    usagePercent,
+    remainingPercent,
+    resetLabel,
+    line: normalized
+  };
+}
+
+function getFileMtimeIso(filePath) {
+  try {
+    return fs.statSync(filePath).mtime.toISOString();
+  } catch {
+    return null;
+  }
+}
+
 function parseCodexQuota(projectPath) {
   const logDir = path.join(projectPath, '.ralph', 'logs');
   const ralphLog = tailFile(path.join(logDir, 'ralph.log'), 2000);
@@ -95,14 +161,20 @@ function parseCodexQuota(projectPath) {
   const fiveHourLine = lastMatch(fiveHourPatterns);
   const weeklyLine = lastMatch(weeklyPatterns);
 
+  const statusFromSignal = (line) => {
+    if (!line) return 'unknown';
+    if (/(limit reached|rate limit reached|exceeded|blocked|try again)/i.test(line)) return 'limited';
+    return 'ok';
+  };
+
   return {
     fiveHour: {
-      status: fiveHourLine ? 'limited' : 'ok',
+      status: statusFromSignal(fiveHourLine),
       lastSignal: fiveHourLine || '',
       source: fiveHourLine ? 'ralph/codex logs' : 'no recent limit signals'
     },
     weekly: {
-      status: weeklyLine ? 'limited' : 'unknown',
+      status: statusFromSignal(weeklyLine),
       lastSignal: weeklyLine || '',
       source: weeklyLine ? 'ralph/codex logs' : 'Codex CLI does not expose weekly usage directly in normal flow'
     },
@@ -116,37 +188,23 @@ function parseCodexStatusSnapshotText(rawText) {
     return null;
   }
 
-  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  const lines = text
+    .split('\n')
+    .map((line) => normalizeStatusLine(line))
+    .filter(Boolean);
   const findLine = (patterns) =>
     lines.find((line) => patterns.some((pattern) => pattern.test(line))) || '';
 
-  const parsePercent = (line) => {
-    const match = /(\d{1,3})\s*%/.exec(line || '');
-    return match ? Number(match[1]) : null;
-  };
-
-  const parseStatus = (line) => {
-    if (!line) return 'unknown';
-    if (/limit|exceeded|blocked|reached/i.test(line)) return 'limited';
-    return 'ok';
-  };
-
   const fiveHourLine = findLine([/5[\s-]?hour/i, /\b5h\b/i]);
   const weeklyLine = findLine([/weekly/i, /\bweek\b/i, /7[\s-]?day/i]);
+  const fiveHour = parseLimitLine(fiveHourLine) || { status: 'unknown', usagePercent: null, remainingPercent: null, line: '' };
+  const weekly = parseLimitLine(weeklyLine) || { status: 'unknown', usagePercent: null, remainingPercent: null, line: '' };
 
   return {
-    fiveHour: {
-      status: parseStatus(fiveHourLine),
-      usagePercent: parsePercent(fiveHourLine),
-      line: fiveHourLine || ''
-    },
-    weekly: {
-      status: parseStatus(weeklyLine),
-      usagePercent: parsePercent(weeklyLine),
-      line: weeklyLine || ''
-    },
+    fiveHour,
+    weekly,
     updatedAt: new Date().toISOString(),
-    raw: text
+    raw: stripAnsi(text)
   };
 }
 
@@ -240,6 +298,13 @@ app.get('/api/project-status', (req, res) => {
   const codexQuota = parseCodexQuota(projectPath);
   const codexStatusSnapshotRaw = safeReadText(codexStatusSnapshotFile);
   const codexStatusSnapshot = parseCodexStatusSnapshotText(codexStatusSnapshotRaw);
+  const snapshotCapturedAt = getFileMtimeIso(codexStatusSnapshotFile);
+  if (codexStatusSnapshot && snapshotCapturedAt) {
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(snapshotCapturedAt)) / 1000));
+    codexStatusSnapshot.capturedAt = snapshotCapturedAt;
+    codexStatusSnapshot.ageSeconds = ageSeconds;
+    codexStatusSnapshot.isStale = ageSeconds > 300;
+  }
 
   res.json({ status, logs, fixPlan, codexQuota, codexStatusSnapshot });
 });
@@ -255,12 +320,35 @@ app.post('/api/codex-status-snapshot', (req, res) => {
   fs.mkdirSync(ralphDir, { recursive: true });
   const snapshotFile = path.join(ralphDir, 'codex_status_snapshot.txt');
   fs.writeFileSync(snapshotFile, String(snapshotText), 'utf8');
+  const parsed = parseCodexStatusSnapshotText(snapshotText);
+  const capturedAt = getFileMtimeIso(snapshotFile);
+  if (parsed && capturedAt) {
+    parsed.capturedAt = capturedAt;
+    parsed.ageSeconds = 0;
+    parsed.isStale = false;
+  }
 
   return res.json({
     saved: true,
     file: snapshotFile,
-    parsed: parseCodexStatusSnapshotText(snapshotText)
+    parsed
   });
+});
+
+app.post('/api/codex-status-snapshot/clear', (req, res) => {
+  const projectPath = req.body?.projectPath;
+  if (!projectPath || !fs.existsSync(projectPath)) {
+    return res.status(400).json({ error: 'projectPath invalido' });
+  }
+  const snapshotFile = path.join(projectPath, '.ralph', 'codex_status_snapshot.txt');
+  try {
+    if (fs.existsSync(snapshotFile)) {
+      fs.unlinkSync(snapshotFile);
+    }
+    return res.json({ cleared: true, file: snapshotFile });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'falha ao limpar snapshot' });
+  }
 });
 
 app.get('/api/export-diagnostics', (req, res) => {

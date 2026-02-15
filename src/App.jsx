@@ -41,8 +41,44 @@ function statusVariant(status) {
 
 function quotaVariant(status) {
   if (status === 'ok') return 'success';
+  if (status === 'warning') return 'warning';
   if (status === 'limited') return 'destructive';
   return 'secondary';
+}
+
+function formatSecondsToHms(totalSeconds) {
+  const safe = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const seconds = safe % 60;
+  return [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':');
+}
+
+function getRemainingPercent(quota) {
+  if (!quota) return null;
+  if (typeof quota.remainingPercent === 'number') return quota.remainingPercent;
+  if (typeof quota.usagePercent === 'number') return Math.max(0, Math.min(100, 100 - quota.usagePercent));
+  return null;
+}
+
+function getQuotaStatus(quota) {
+  if (!quota) return 'unknown';
+  if (quota.status === 'limited') return 'limited';
+  const remaining = getRemainingPercent(quota);
+  if (remaining == null) return quota.status || 'unknown';
+  if (remaining <= 0) return 'limited';
+  if (remaining <= 10) return 'warning';
+  return 'ok';
+}
+
+function formatAge(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `${h}h ${remM}m`;
 }
 
 export function App() {
@@ -56,6 +92,7 @@ export function App() {
   const [logs, setLogs] = useState('');
   const [fixPlan, setFixPlan] = useState('');
   const [message, setMessage] = useState('');
+  const [nowEpoch, setNowEpoch] = useState(() => Math.floor(Date.now() / 1000));
 
   async function refreshProcesses() {
     try {
@@ -183,6 +220,25 @@ export function App() {
     }
   }
 
+  async function clearCodexStatusSnapshot() {
+    try {
+      const res = await fetch('/api/codex-status-snapshot/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectPath })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMessage(`Erro ao limpar snapshot: ${data.error || 'falha inesperada'}`);
+        return;
+      }
+      setMessage('Snapshot do /status removido');
+      await refreshProject();
+    } catch {
+      setMessage('Erro ao limpar snapshot');
+    }
+  }
+
   useEffect(() => {
     refreshProcesses();
     refreshProject();
@@ -191,6 +247,13 @@ export function App() {
       refreshProject();
     }, 4000);
     return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    const tickId = setInterval(() => {
+      setNowEpoch(Math.floor(Date.now() / 1000));
+    }, 1000);
+    return () => clearInterval(tickId);
   }, []);
 
   const processCount = processes.length;
@@ -204,6 +267,28 @@ export function App() {
   }, [status]);
   const fiveHourQuota = codexStatusSnapshot?.fiveHour || codexQuota?.fiveHour || { status: 'unknown', source: 'Sem dados' };
   const weeklyQuota = codexStatusSnapshot?.weekly || codexQuota?.weekly || { status: 'unknown', source: 'Sem dados' };
+  const hasSnapshot = Boolean(codexStatusSnapshot?.capturedAt);
+  const fiveHourRemaining = getRemainingPercent(fiveHourQuota);
+  const weeklyRemaining = getRemainingPercent(weeklyQuota);
+  const fiveHourStatus = getQuotaStatus(fiveHourQuota);
+  const weeklyStatus = getQuotaStatus(weeklyQuota);
+  const snapshotAgeLabel = hasSnapshot ? formatAge(codexStatusSnapshot?.ageSeconds) : null;
+  const liveSessionElapsed = useMemo(() => {
+    if (status?.session_started_epoch && Number(status.session_started_epoch) > 0) {
+      return formatSecondsToHms(nowEpoch - Number(status.session_started_epoch));
+    }
+    return status?.session_elapsed_hms ?? '00:00:00';
+  }, [status, nowEpoch]);
+  const liveLoopElapsed = useMemo(() => {
+    if (
+      status?.loop_started_epoch &&
+      Number(status.loop_started_epoch) > 0 &&
+      (status?.last_action === 'executing' || status?.status === 'running')
+    ) {
+      return formatSecondsToHms(nowEpoch - Number(status.loop_started_epoch));
+    }
+    return status?.loop_elapsed_hms ?? '00:00:00';
+  }, [status, nowEpoch]);
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -224,16 +309,21 @@ export function App() {
                 <Activity className="mr-1.5 h-3.5 w-3.5" />
                 {headlineStatus.toUpperCase()}
               </Badge>
-              <Badge variant={quotaVariant(fiveHourQuota.status)} className="px-3 py-1 text-xs">
+              <Badge variant={quotaVariant(fiveHourStatus)} className="px-3 py-1 text-xs">
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
-                CODEX 5H: {String(fiveHourQuota.status).toUpperCase()}
+                CODEX 5H: {fiveHourRemaining != null ? `${fiveHourRemaining}% REMAINING` : 'NO SNAPSHOT'}
               </Badge>
-              <Badge variant={quotaVariant(weeklyQuota.status)} className="px-3 py-1 text-xs">
+              <Badge variant={quotaVariant(weeklyStatus)} className="px-3 py-1 text-xs">
                 <Terminal className="mr-1.5 h-3.5 w-3.5" />
-                CODEX WEEKLY: {String(weeklyQuota.status).toUpperCase()}
+                CODEX WEEKLY: {weeklyRemaining != null ? `${weeklyRemaining}% REMAINING` : 'NO SNAPSHOT'}
               </Badge>
+              {hasSnapshot && (
+                <Badge variant={codexStatusSnapshot?.isStale ? 'warning' : 'outline'} className="px-3 py-1 text-xs">
+                  Snapshot /status: {codexStatusSnapshot?.isStale ? 'STALE' : 'FRESH'} ({snapshotAgeLabel} ago)
+                </Badge>
+              )}
               <Badge variant="outline" className="px-3 py-1 text-xs">
-                <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {status?.session_elapsed_hms ?? '00:00:00'}
+                <Timer className="mr-1.5 h-3.5 w-3.5" /> Sessão: {liveSessionElapsed}
               </Badge>
             </div>
           </div>
@@ -254,7 +344,7 @@ export function App() {
         <Card>
           <CardHeader className="pb-2">
             <CardDescription>Timer do Loop</CardDescription>
-            <CardTitle className="text-2xl">{status?.loop_elapsed_hms ?? '00:00:00'}</CardTitle>
+            <CardTitle className="text-2xl">{liveLoopElapsed}</CardTitle>
           </CardHeader>
           <CardContent className="text-xs text-muted-foreground">Status: {status?.last_action ?? 'idle'}</CardContent>
         </Card>
@@ -279,12 +369,12 @@ export function App() {
           <CardHeader className="pb-2">
             <CardDescription>Cota Codex (5h)</CardDescription>
             <CardTitle className="text-2xl">
-              {fiveHourQuota.status}
-              {fiveHourQuota.usagePercent != null ? ` (${fiveHourQuota.usagePercent}%)` : ''}
+              {fiveHourRemaining != null ? `${fiveHourRemaining}% remaining` : '--'}
             </CardTitle>
           </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">
-            {fiveHourQuota.line || fiveHourQuota.lastSignal || fiveHourQuota.source}
+          <CardContent className="space-y-1 text-xs text-muted-foreground">
+            <div>Reset: {fiveHourQuota.resetLabel || '--'}</div>
+            <div>Source: {hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics'}</div>
           </CardContent>
         </Card>
 
@@ -292,12 +382,12 @@ export function App() {
           <CardHeader className="pb-2">
             <CardDescription>Cota Codex (Semanal)</CardDescription>
             <CardTitle className="text-2xl">
-              {weeklyQuota.status}
-              {weeklyQuota.usagePercent != null ? ` (${weeklyQuota.usagePercent}%)` : ''}
+              {weeklyRemaining != null ? `${weeklyRemaining}% remaining` : '--'}
             </CardTitle>
           </CardHeader>
-          <CardContent className="text-xs text-muted-foreground">
-            {weeklyQuota.line || weeklyQuota.lastSignal || weeklyQuota.source}
+          <CardContent className="space-y-1 text-xs text-muted-foreground">
+            <div>Reset: {weeklyQuota.resetLabel || '--'}</div>
+            <div>Source: {hasSnapshot ? `/status snapshot (${snapshotAgeLabel} ago)` : 'logs / heuristics'}</div>
           </CardContent>
         </Card>
       </section>
@@ -343,6 +433,9 @@ export function App() {
               </Button>
               <Button variant="secondary" onClick={saveCodexStatusSnapshot}>
                 <Terminal className="h-4 w-4" /> Salvar `/status`
+              </Button>
+              <Button variant="outline" onClick={clearCodexStatusSnapshot}>
+                <Square className="h-4 w-4" /> Limpar snapshot `/status`
               </Button>
               <Button variant="outline" onClick={exportDiagnostics}>
                 <Download className="h-4 w-4" /> Exportar Diagnostico
