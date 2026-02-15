@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  Maximize2,
+  Minimize2,
   Download,
   FolderSearch,
   Gauge,
@@ -94,6 +96,30 @@ function getApiLimitRemainingSeconds(status, nowEpoch) {
   return 0;
 }
 
+function getLogLevel(line) {
+  const match = String(line || '').match(/\[(INFO|WARN|ERROR|SUCCESS|LOOP|DEBUG)\]/i);
+  return match ? String(match[1]).toUpperCase() : '';
+}
+
+function getLogLineClass(level) {
+  switch (level) {
+    case 'ERROR':
+      return 'text-red-300';
+    case 'WARN':
+      return 'text-amber-300';
+    case 'SUCCESS':
+      return 'text-emerald-300';
+    case 'LOOP':
+      return 'text-violet-300';
+    case 'DEBUG':
+      return 'text-cyan-300';
+    case 'INFO':
+      return 'text-slate-200';
+    default:
+      return 'text-slate-400';
+  }
+}
+
 export function App() {
   const [projectPath, setProjectPath] = useState(DEFAULT_PROJECT);
   const [args, setArgs] = useState('--sandbox workspace-write --full-auto --timeout 20 --calls 30 --verbose');
@@ -109,6 +135,7 @@ export function App() {
   const [message, setMessage] = useState('');
   const [nowEpoch, setNowEpoch] = useState(() => Math.floor(Date.now() / 1000));
   const [logsAutoScroll, setLogsAutoScroll] = useState(true);
+  const [logsFullscreen, setLogsFullscreen] = useState(false);
   const logsRef = useRef(null);
 
   async function refreshProcesses() {
@@ -271,6 +298,15 @@ export function App() {
     }
   }
 
+  async function copyLogsToClipboard() {
+    try {
+      await navigator.clipboard.writeText(String(logs || ''));
+      setMessage('Logs copiados para a area de transferencia');
+    } catch {
+      setMessage('Erro ao copiar logs');
+    }
+  }
+
   useEffect(() => {
     refreshProcesses();
     refreshProject();
@@ -292,6 +328,17 @@ export function App() {
     if (!logsAutoScroll || !logsRef.current) return;
     logsRef.current.scrollTop = logsRef.current.scrollHeight;
   }, [logs, logsAutoScroll]);
+
+  useEffect(() => {
+    if (!logsFullscreen) return;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setLogsFullscreen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [logsFullscreen]);
 
   const processCount = processes.length;
   const callsSummary = status
@@ -349,6 +396,7 @@ export function App() {
   const diagnosticsRootCause = diagnostics?.rootCause || 'Sem diagnostico consolidado';
   const diagnosticsRecommendation = diagnostics?.recommendation || 'Atualize o diagnostico para obter recomendacoes.';
   const diagnosticsSource = diagnostics?.source || 'derived';
+  const logLines = useMemo(() => String(logs || '').split('\n'), [logs]);
 
   return (
     <main className="mx-auto max-w-[1400px] px-4 pb-10 pt-8 md:px-8">
@@ -608,13 +656,26 @@ export function App() {
           <CardHeader>
             <div className="flex items-center justify-between gap-3">
               <CardTitle className="text-lg">Logs (`ralph.log`)</CardTitle>
-              <Button
-                variant={logsAutoScroll ? 'secondary' : 'outline'}
-                size="sm"
-                onClick={() => setLogsAutoScroll((prev) => !prev)}
-              >
-                {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
+                  Copiar logs
+                </Button>
+                <Button
+                  variant={logsAutoScroll ? 'secondary' : 'outline'}
+                  size="sm"
+                  onClick={() => setLogsAutoScroll((prev) => !prev)}
+                >
+                  {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setLogsFullscreen((prev) => !prev)}
+                >
+                  {logsFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+                  {logsFullscreen ? 'Sair Fullscreen' : 'Fullscreen'}
+                </Button>
+              </div>
             </div>
           </CardHeader>
           <CardContent>
@@ -622,7 +683,17 @@ export function App() {
               ref={logsRef}
               className="log-surface max-h-[420px] overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200"
             >
-              {logs || 'Sem logs disponíveis.'}
+              {logs
+                ? logLines.map((line, index) => {
+                    const level = getLogLevel(line);
+                    return (
+                      <React.Fragment key={`log-line-${index}`}>
+                        <span className={getLogLineClass(level)}>{line}</span>
+                        {index < logLines.length - 1 ? '\n' : ''}
+                      </React.Fragment>
+                    );
+                  })
+                : 'Sem logs disponíveis.'}
             </pre>
           </CardContent>
         </Card>
@@ -638,6 +709,51 @@ export function App() {
           </CardContent>
         </Card>
       </section>
+
+      {logsFullscreen && (
+        <div className="fixed inset-0 z-50 bg-background/95 p-4 md:p-6">
+          <Card className="h-full">
+            <CardHeader>
+              <div className="flex items-center justify-between gap-3">
+                <CardTitle className="text-lg">Logs (`ralph.log`) - Fullscreen</CardTitle>
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" size="sm" onClick={copyLogsToClipboard}>
+                    Copiar logs
+                  </Button>
+                  <Button
+                    variant={logsAutoScroll ? 'secondary' : 'outline'}
+                    size="sm"
+                    onClick={() => setLogsAutoScroll((prev) => !prev)}
+                  >
+                    {logsAutoScroll ? 'Auto-scroll: ON' : 'Auto-scroll: OFF'}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setLogsFullscreen(false)}>
+                    <Minimize2 className="h-3.5 w-3.5" /> Fechar
+                  </Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="h-[calc(100%-76px)]">
+              <pre
+                ref={logsRef}
+                className="log-surface h-full overflow-auto rounded-md border border-border/60 bg-background/60 p-3 text-xs text-slate-200"
+              >
+                {logs
+                  ? logLines.map((line, index) => {
+                      const level = getLogLevel(line);
+                      return (
+                        <React.Fragment key={`log-line-fs-${index}`}>
+                          <span className={getLogLineClass(level)}>{line}</span>
+                          {index < logLines.length - 1 ? '\n' : ''}
+                        </React.Fragment>
+                      );
+                    })
+                  : 'Sem logs disponíveis.'}
+              </pre>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </main>
   );
 }
